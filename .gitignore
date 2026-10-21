@@ -1,0 +1,9 @@
+.tools/
+build/
+release/
+runtime/
+.zig-cache/
+zig-out/
+*.user
+*.suo
+
