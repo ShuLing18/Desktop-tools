@@ -1,0 +1,102 @@
+{
+  "date": "2026-10-25",
+  "scenario": "same machine and DPI; five isolated boxes, 80 text files each; three alternating before/after pairs; first frame is ShowPanel plus UpdateWindow return, not monitor scanout",
+  "before": {
+    "folder": "performance-paired-before-0.4.7",
+    "runs": 3,
+    "first_frame": {
+      "median_ms": 77.7207,
+      "min_ms": 50.9087,
+      "max_ms": 106.0563,
+      "samples": 15
+    },
+    "rapid_switch": {
+      "median_ms": 61.1294,
+      "min_ms": 38.2693,
+      "max_ms": 91.7953,
+      "samples": 45
+    },
+    "settled_reopen": null,
+    "same_box_reopen": null,
+    "capture": null,
+    "blur": null,
+    "render_60_frames_ms": 563.558,
+    "render_each_run_ms": [
+      367.8957,
+      563.558,
+      882.0836
+    ],
+    "immediate_closed_private_bytes": 6078464,
+    "idle_private_bytes": 6078464,
+    "idle_working_set": 36954112,
+    "peak_private_bytes": 10846208,
+    "idle_threads": 8,
+    "idle_gdi_objects": 311,
+    "exe_bytes": 405504,
+    "sha256": "66b3984b8537fd3059b7859439a9966906508e02c46f3170a25698000a07a91c"
+  },
+  "after": {
+    "folder": "performance-paired-after-0.4.7",
+    "runs": 3,
+    "first_frame": {
+      "median_ms": 45.5971,
+      "min_ms": 33.2194,
+      "max_ms": 74.2313,
+      "samples": 15
+    },
+    "rapid_switch": {
+      "median_ms": 31.5727,
+      "min_ms": 24.3723,
+      "max_ms": 46.6454,
+      "samples": 45
+    },
+    "settled_reopen": {
+      "median_ms": 23.3592,
+      "min_ms": 15.6524,
+      "max_ms": 32.2173,
+      "samples": 45
+    },
+    "same_box_reopen": {
+      "median_ms": 14.7634,
+      "min_ms": 8.3754,
+      "max_ms": 46.5191,
+      "samples": 45
+    },
+    "capture": {
+      "median_ms": 9.1449,
+      "min_ms": 8.1314,
+      "max_ms": 10.4403,
+      "samples": 15
+    },
+    "blur": {
+      "median_ms": 10.3372,
+      "min_ms": 9.0265,
+      "max_ms": 15.427,
+      "samples": 15
+    },
+    "render_60_frames_ms": 241.7222,
+    "render_each_run_ms": [
+      176.7795,
+      253.5031,
+      241.7222
+    ],
+    "immediate_closed_private_bytes": 9691136,
+    "idle_private_bytes": 6344704,
+    "idle_working_set": 37314560,
+    "peak_private_bytes": 12304384,
+    "idle_threads": 8,
+    "idle_gdi_objects": 308,
+    "exe_bytes": 428032,
+    "sha256": "6a2ba9d81d15e110c1e918699757aecd19a631ec619bb926221f2852f0cd115a"
+  },
+  "checks_passed": 280,
+  "cache_policy": {
+    "backdrop_entries": 1,
+    "max_backdrop_bytes": 4194304,
+    "retention_ms": 500,
+    "text_masks_per_box": 48,
+    "text_mask_cache_bytes_per_box": 196608
+  },
+  "render_reduction_percent": 57.10783983192502,
+  "switch_reduction_percent": 48.351038943617965
+}

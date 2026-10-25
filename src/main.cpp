@@ -31,6 +31,8 @@
 #include "desktop_mouse.h"
 #include "native_entry.h"
 #include "backdrop.h"
+#include "backdrop_loader.h"
+#include "render_cache.h"
 #include "shell_menu.h"
 #include "shell_registration.h"
 #include "fluent_settings.h"
@@ -50,8 +52,22 @@ constexpr UINT kRenderAnchor = WM_APP + 5;
 constexpr UINT kNativeMouse = WM_APP + 6;
 constexpr UINT kNativeChanged = WM_APP + 10;
 constexpr UINT kNativeContext = WM_APP + 11, kShellIconChanged = WM_APP + 12, kCreateShellBox = WM_APP + 13;
+constexpr UINT kBackdropReady = WM_APP + 14;
+constexpr UINT kCompleteShellSetup = WM_APP + 15;
+constexpr UINT kCompleteBackdropHide = WM_APP + 16;
+constexpr UINT kWarmIcons = WM_APP + 17;
+bool backdropNeedsFlush = false; // Accessed only by this UI thread.
+void FlushBackdropHide() {
+    if (backdropNeedsFlush) { DwmFlush(); backdropNeedsFlush = false; }
+}
+void NoteBackdropHide(HWND receiver) {
+    backdropNeedsFlush = true;
+    if (receiver) PostMessageW(receiver, kCompleteBackdropHide, 0, 0);
+}
 constexpr UINT_PTR kCloseTimer = 1, kDesktopTimer = 2, kRefreshTimer = 3, kNativeRefreshTimer = 4, kSelectionScrollTimer = 5;
 constexpr UINT_PTR kLayoutTimer = 6, kPointerSettleTimer = 7;
+constexpr UINT_PTR kBackdropCacheTimer = 8;
+constexpr UINT_PTR kTextCacheTimer = 9;
 constexpr UINT kPanelCloseDelay = 120;
 constexpr int kSearchControl = 1201;
 enum : UINT { kAddItems = 100, kOpenData,
@@ -66,6 +82,38 @@ struct FlagGuard {
     void Restore() { if (active) { flag = previous; active = false; } }
     ~FlagGuard() { Restore(); }
 };
+
+class RecentBackdrop {
+    box::Backdrop value_;
+    HWND owner_ = nullptr;
+    ULONGLONG until_ = 0;
+public:
+    void Clear() {
+        if (owner_) KillTimer(owner_, kBackdropCacheTimer);
+        owner_ = nullptr; until_ = 0; value_.Clear();
+    }
+    bool Retain(box::Backdrop value, HWND owner) {
+        Clear();
+        if (!owner || value.MemoryBytes() > 4 * 1024 * 1024 || !value.MemoryBytes()) return false;
+        value_ = std::move(value); owner_ = owner; until_ = GetTickCount64() + 500;
+        if (!SetTimer(owner_, kBackdropCacheTimer, 500, nullptr)) { Clear(); return false; }
+        return true;
+    }
+    bool Take(RECT screen, box::Backdrop& output) {
+        if (!until_ || GetTickCount64() >= until_ || !value_.Matches(screen)) { Clear(); return false; }
+        output = std::move(value_); Clear(); return true;
+    }
+    void Expire(HWND receiver, ULONGLONG now = GetTickCount64()) {
+        KillTimer(receiver, kBackdropCacheTimer);
+        if (receiver != owner_ || !until_) return;
+        if (now < until_) { if (!SetTimer(receiver, kBackdropCacheTimer, static_cast<UINT>(until_ - now), nullptr)) Clear(); }
+        else Clear();
+    }
+    void ForgetOwner(HWND owner) { if (owner_ == owner) Clear(); }
+    size_t Bytes() const { return value_.MemoryBytes(); }
+    ULONGLONG Until() const { return until_; }
+};
+RecentBackdrop recentBackdrop;
 
 template<class T> class ComPtr {
     T* value_ = nullptr;
@@ -366,6 +414,12 @@ public:
         { std::lock_guard<std::mutex> lock(worker_->mutex); worker_->requests.push_back({destination_, client_, generation, index, path, size}); }
         worker_->event.notify_one();
     }
+    void Prioritize() {
+        if (!worker_) return;
+        std::lock_guard<std::mutex> lock(worker_->mutex);
+        std::stable_partition(worker_->requests.begin(), worker_->requests.end(),
+            [this](const Request& request) { return request.client == client_; });
+    }
     void Stop() {
         Clear();
         if (worker_) {
@@ -580,6 +634,16 @@ private:
     int backgroundMode_ = 0, glassTransparency_ = 55, glassBlur_ = 18;
     bool customGlass_ = false;
     box::Backdrop backdrop_;
+    box::BackdropLoader backdropLoader_;
+    ULONGLONG backdropGeneration_ = 0;
+    bool backdropPending_ = false;
+    int pendingBlur_ = -1;
+    box::DibSurface panelSurface_;
+    mutable box::TextMasks textMasks_;
+    ULONGLONG textCacheUntil_ = 0;
+    int roundedWidth_ = 0, roundedHeight_ = 0, roundedDark_ = -1;
+    UINT roundedDpi_ = 0;
+    DWORD roundedBackdrop_ = 0;
     box::ShellMenu shellMenu_;
     std::unique_ptr<box::FluentSettings> settings_;
     std::wstring previewIconFile_;
@@ -720,19 +784,39 @@ private:
     void Round(HWND window) {
         if (!window) return;
         if (window == host) { SetWindowRgn(host, nullptr, TRUE); return; }
-        const DWORD preference = 2;
-        DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(33), &preference, sizeof(preference));
+        if (!roundedBackdrop_) {
+            const DWORD preference = 2;
+            DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(33), &preference, sizeof(preference));
+        }
         const BOOL dark = dark_;
-        DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(20), &dark, sizeof(dark));
+        if (roundedDark_ != dark) {
+            DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(20), &dark, sizeof(dark)); roundedDark_ = dark;
+        }
         const DWORD backdrop = backgroundMode_ == 0 && !customGlass_ ? 3 : 1;
-        acrylic_ = backdrop == 3 && SUCCEEDED(DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(38), &backdrop, sizeof(backdrop)));
-        if (backdrop != 3) DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(38), &backdrop, sizeof(backdrop));
-        MARGINS margins = acrylic_ ? MARGINS{-1, -1, -1, -1} : MARGINS{0, 0, 0, 0};
-        DwmExtendFrameIntoClientArea(window, &margins);
+        if (roundedBackdrop_ != backdrop) {
+            const HRESULT changed = DwmSetWindowAttribute(window, static_cast<DWMWINDOWATTRIBUTE>(38), &backdrop, sizeof(backdrop));
+            acrylic_ = backdrop == 3 && SUCCEEDED(changed); roundedBackdrop_ = backdrop;
+            MARGINS margins = acrylic_ ? MARGINS{-1, -1, -1, -1} : MARGINS{0, 0, 0, 0};
+            DwmExtendFrameIntoClientArea(window, &margins);
+        }
         RECT rect{}; GetClientRect(window, &rect);
-        SetWindowRgn(window, CreateRoundRectRgn(0, 0, rect.right + 1, rect.bottom + 1, Px(18), Px(18)), TRUE);
+        if (roundedWidth_ != rect.right || roundedHeight_ != rect.bottom || roundedDpi_ != dpi_) {
+            SetWindowRgn(window, CreateRoundRectRgn(0, 0, rect.right + 1, rect.bottom + 1, Px(18), Px(18)), TRUE);
+            roundedWidth_ = rect.right; roundedHeight_ = rect.bottom; roundedDpi_ = dpi_;
+        }
+    }
+    void DropTextCache() {
+        if (host) KillTimer(host, kTextCacheTimer);
+        textCacheUntil_ = 0; textMasks_.Clear();
+    }
+    void ReleaseTextCache(ULONGLONG now) {
+        if (!textCacheUntil_ || panelVisible_) { if (host) KillTimer(host, kTextCacheTimer); textCacheUntil_ = 0; return; }
+        if (now < textCacheUntil_) {
+            if (!SetTimer(host, kTextCacheTimer, static_cast<UINT>(textCacheUntil_ - now), nullptr)) DropTextCache();
+        } else DropTextCache();
     }
     void LoadAppearance() {
+        DropTextCache();
         DWORD value = 1, size = sizeof(value);
         RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
                      L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size);
@@ -929,15 +1013,16 @@ private:
         if (!control && !shift) selection_.Clear();
         ClearTooltips(); SetCapture(panel); SelectionChanged();
     }
-    void QueueVisibleIcons() {
+    void QueueVisibleIcons(bool warm = false) {
         const size_t start = static_cast<size_t>(firstRow_ * 4);
-        const size_t end = std::min(items_.size(), start + static_cast<size_t>(VisibleRows() * 4));
+        const size_t end = std::min(items_.size(), start + static_cast<size_t>((warm ? 3 : VisibleRows()) * 4));
         if (start == end) return;
         if (!iconThreadStarted_) { icons_.Start(host); iconThreadStarted_ = true; }
         for (size_t i = start; i < end; ++i) if (!requestedIcons_[i]) {
             requestedIcons_[i] = true;
             icons_.RequestIcon(generation_, i, items_[i].path, Px(36));
         }
+        if (!warm) icons_.Prioritize();
         // Keep at most 64 loaded icons. Evicted rows are loaded again only when visited.
         if (items_.size() > 64) {
             const size_t keepStart = start > 24 ? start - 24 : 0;
@@ -1022,27 +1107,37 @@ private:
         const auto placement = box::PlacePanel(anchor, work, Px(416), desiredHeight, Px(10), direction_);
         SetWindowPos(panel, HWND_TOPMOST, placement.rect.left, placement.rect.top,
                      placement.rect.right - placement.rect.left, placement.rect.bottom - placement.rect.top, SWP_NOACTIVATE);
-        Round(panel);
         firstRow_ = std::clamp(firstRow_, 0, MaxRow());
         UpdateTooltips();
         if (panelVisible_) PrepareBackdrop();
     }
     void PrepareBackdrop() {
         if (backgroundMode_ != 0 || !panel || !glassTransparency_) {
+            backdropLoader_.Stop(); ++backdropGeneration_; backdropPending_ = false; pendingBlur_ = -1;
+            recentBackdrop.Clear();
             backdrop_.Clear(); customGlass_ = panel && backgroundMode_ == 0;
             Round(panel); return;
         }
         RECT rect{}; GetWindowRect(panel, &rect);
-        if (!backdrop_.Matches(rect.right - rect.left, rect.bottom - rect.top)) {
-            const bool visible = IsWindowVisible(panel) != FALSE;
-            if (visible) ShowWindow(panel, SW_HIDE);
-            // Complete the old panel's hide before sampling the new backdrop, so
-            // its previous frame cannot remain as a second panel in the glass.
-            DwmFlush();
-            customGlass_ = backdrop_.Capture(rect);
-            if (visible) ShowWindow(panel, SW_SHOWNOACTIVATE);
-        } else customGlass_ = true;
-        backdrop_.Blur(Px(glassBlur_)); Round(panel);
+        if (!backdrop_.Matches(rect)) {
+            backdropLoader_.Cancel(); ++backdropGeneration_; backdropPending_ = false; pendingBlur_ = -1;
+            if (!recentBackdrop.Take(rect, backdrop_)) {
+                const bool visible = IsWindowVisible(panel) != FALSE;
+                if (visible) { ShowWindow(panel, SW_HIDE); NoteBackdropHide(owner_ ? owner_ : host); }
+                // Clear the previous composed frame before a genuinely new capture.
+                FlushBackdropHide();
+                backdrop_.Clear(); backdrop_.Capture(rect);
+                if (visible) ShowWindow(panel, SW_SHOWNOACTIVATE);
+            }
+        }
+        const int strength = std::clamp(Px(glassBlur_), 0, 120);
+        customGlass_ = backdrop_.HasPixels();
+        if (backdrop_.Matches(rect) && !backdrop_.Ready(strength) && (!backdropPending_ || pendingBlur_ != strength)) {
+            backdropLoader_.Start(host, kBackdropReady);
+            backdropPending_ = true; pendingBlur_ = strength; ++backdropGeneration_;
+            backdropLoader_.RequestBlur(backdrop_, strength, backdropGeneration_);
+        }
+        Round(panel);
     }
     void ApplyAppearance() {
         DWORD light = 1, bytes = sizeof(light);
@@ -1207,9 +1302,9 @@ private:
         draggingPaths_.clear(); for (const auto& path : paths) storage.ForgetMovedOut(path); Reload();
         dialogGuard.Restore(); ScheduleClose();
     }
-    void MakeOpaque(RECT rect) const {
+    void MakeOpaque(RECT rect, bool flush = true) const {
         if (!paintPixels_) return;
-        GdiFlush();
+        if (flush) GdiFlush();
         for (int y = std::max(0L, rect.top); y < std::min(static_cast<LONG>(paintHeight_), rect.bottom); ++y)
             for (int x = std::max(0L, rect.left); x < std::min(static_cast<LONG>(paintWidth_), rect.right); ++x) {
                 DWORD& pixel = paintPixels_[y * paintWidth_ + x];
@@ -1227,23 +1322,9 @@ private:
               UINT flags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS, bool shadow = false) const {
         const int width = rect.right - rect.left, height = rect.bottom - rect.top;
         if (width <= 0 || height <= 0 || !paintPixels_ || text.empty()) return;
-        HDC maskDC = CreateCompatibleDC(dc);
-        if (!maskDC) return;
-        BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        info.bmiHeader.biWidth = width; info.bmiHeader.biHeight = -height;
-        info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
-        DWORD* mask = nullptr;
-        HBITMAP bitmap = CreateDIBSection(maskDC, &info, DIB_RGB_COLORS, reinterpret_cast<void**>(&mask), nullptr, 0);
-        if (!bitmap) { DeleteDC(maskDC); return; }
-        auto oldBitmap = SelectObject(maskDC, bitmap), oldFont = SelectObject(maskDC, font);
-        std::fill_n(mask, static_cast<size_t>(width) * height, 0u);
-        SetBkMode(maskDC, TRANSPARENT); SetTextColor(maskDC, RGB(255, 255, 255));
-        RECT layout{0, 0, width, height};
-        DrawTextW(maskDC, text.c_str(), static_cast<int>(text.size()), &layout, flags | DT_NOPREFIX);
-        GdiFlush();
-        auto coverage = [&](int x, int y) -> unsigned {
-            return x >= 0 && x < width && y >= 0 && y < height ? mask[y * width + x] & 255 : 0;
-        };
+        const auto* glyph = textMasks_.Get(dc, text, font, width, height, flags);
+        if (!glyph) return;
+        auto coverage = [&](int x, int y) { return glyph->At(x, y); };
         auto blend = [&](int x, int y, unsigned alpha, COLORREF ink) {
             x += rect.left; y += rect.top;
             if (!alpha || x < 0 || x >= paintWidth_ || y < 0 || y >= paintHeight_) return;
@@ -1265,8 +1346,9 @@ private:
                 blend(x, y, sum * 96 / (16 * 255), RGB(0, 0, 0));
             }
         }
-        for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) blend(x, y, coverage(x, y), color);
-        SelectObject(maskDC, oldFont); SelectObject(maskDC, oldBitmap); DeleteObject(bitmap); DeleteDC(maskDC);
+        for (LONG y = glyph->ink.top; y < glyph->ink.bottom; ++y)
+            for (LONG x = glyph->ink.left; x < glyph->ink.right; ++x) blend(x, y, coverage(x, y), color);
+        textMasks_.ReleaseTransient();
     }
     void DrawItemIcon(HDC dc, RECT rect, HICON icon) const {
         DrawIconEx(dc, rect.left, rect.top, icon, rect.right - rect.left, rect.bottom - rect.top, 0, nullptr, DI_NORMAL);
@@ -1318,18 +1400,13 @@ private:
     HRESULT RenderSurface(HWND hwnd, bool isPanel, HDC target, std::vector<DWORD>* anchorSnapshot = nullptr) {
         RECT rect{}; GetClientRect(hwnd, &rect);
         if (rect.right <= 0 || rect.bottom <= 0) return E_INVALIDARG;
-        HDC dc = CreateCompatibleDC(target);
-        if (!dc) return E_OUTOFMEMORY;
-        BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        info.bmiHeader.biWidth = rect.right; info.bmiHeader.biHeight = -rect.bottom;
-        info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
-        void* pixels = nullptr;
-        HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
-        if (!bitmap) { DeleteDC(dc); return E_OUTOFMEMORY; }
-        auto previous = SelectObject(dc, bitmap);
-        paintPixels_ = static_cast<DWORD*>(pixels); paintWidth_ = rect.right; paintHeight_ = rect.bottom;
-        std::fill_n(paintPixels_, static_cast<size_t>(rect.right) * rect.bottom, isPanel ? 0u : 0x01000000u);
+        box::DibSurface anchorSurface;
+        auto& surface = isPanel ? panelSurface_ : anchorSurface;
+        if (!surface.Ensure(target, rect.right, rect.bottom)) return E_OUTOFMEMORY;
+        HDC dc = surface.DC();
+        paintPixels_ = surface.Pixels(); paintWidth_ = rect.right; paintHeight_ = rect.bottom;
         if (!isPanel) {
+            std::fill_n(paintPixels_, static_cast<size_t>(rect.right) * rect.bottom, 0x01000000u);
             DrawItemIcon(dc, AnchorIconRect(), folderIcon_.value);
             Text(dc, name_, AnchorLabelRect(), desktopFont_, RGB(255, 255, 255), DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS, true);
             if (totalItems_) {
@@ -1338,14 +1415,19 @@ private:
                 Text(dc, totalItems_ > 99 ? L"99+" : std::to_wstring(totalItems_), badge, smallFont_, RGB(255, 255, 255), DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             }
         } else {
-            FillRound(dc, rect, acrylic_ ? RGB(0, 0, 0) : Background(), dragIncoming ? RGB(51, 120, 242) : Border(), 18);
-            if (backgroundMode_ == 0 && customGlass_) {
-                backdrop_.Draw(paintPixels_, rect.right, rect.bottom, glassTransparency_, Background());
-                HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(dc, GetStockObject(HOLLOW_BRUSH)));
-                HPEN pen = CreatePen(PS_SOLID, 1, dragIncoming ? RGB(51, 120, 242) : Border()); HPEN oldPen = static_cast<HPEN>(SelectObject(dc, pen));
-                RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, Px(18), Px(18));
-                SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(pen); MakeOpaque(rect);
+            if (!(backgroundMode_ == 0 && customGlass_ && backdrop_.Draw(paintPixels_, rect.right, rect.bottom, glassTransparency_, Background()))) {
+                const COLORREF background = Background();
+                const DWORD pixel = acrylic_ ? 0 : 0xFF000000 | (static_cast<DWORD>(GetRValue(background)) << 16) |
+                    (static_cast<DWORD>(GetGValue(background)) << 8) | GetBValue(background);
+                std::fill_n(paintPixels_, static_cast<size_t>(rect.right) * rect.bottom, pixel);
             }
+            HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(dc, GetStockObject(HOLLOW_BRUSH)));
+            HPEN border = CreatePen(PS_SOLID, 1, dragIncoming ? RGB(51, 120, 242) : Border()); HPEN oldPen = static_cast<HPEN>(SelectObject(dc, border));
+            RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, Px(18), Px(18));
+            SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(border); GdiFlush();
+            const LONG edge = Px(18);
+            MakeOpaque({0, 0, rect.right, edge}, false); MakeOpaque({0, rect.bottom - edge, rect.right, rect.bottom}, false);
+            MakeOpaque({0, edge, edge, rect.bottom - edge}, false); MakeOpaque({rect.right - edge, edge, rect.right, rect.bottom - edge}, false);
             DrawItemIcon(dc, {Px(19), Px(20), Px(47), Px(48)}, folderIcon_.value);
             const RECT search = SearchRect();
             Text(dc, name_, {Px(58), Px(16), search.left - Px(8), Px(39)}, titleFont_, Foreground());
@@ -1425,7 +1507,6 @@ private:
             }
         }
         paintPixels_ = nullptr;
-        SelectObject(dc, previous); DeleteObject(bitmap); DeleteDC(dc);
         return result;
     }
     HRESULT RenderAnchor(std::vector<DWORD>* snapshot = nullptr) {
@@ -1635,6 +1716,7 @@ private:
         LRESULT menuResult = 0; if (isPanel && shellMenu_.Message(message, w, l, menuResult)) return menuResult;
         if (!isPanel && taskbarCreated_ && message == taskbarCreated_) { SetTimer(host, kDesktopTimer, 160, nullptr); return 0; }
         switch (message) {
+        case kCompleteBackdropHide: FlushBackdropHide(); return 0;
         case kRenderAnchor:
             anchorPaintPending_ = false; Check(RenderAnchor()); return 0;
         case WM_PAINT: Paint(hwnd, isPanel); return 0;
@@ -1818,6 +1900,8 @@ private:
         case WM_ACTIVATE:
             if (isPanel && LOWORD(w) == WA_INACTIVE) ScheduleClose(); return 0;
         case WM_TIMER:
+            if (w == kBackdropCacheTimer) { recentBackdrop.Expire(hwnd); return 0; }
+            if (w == kTextCacheTimer) { ReleaseTextCache(GetTickCount64()); return 0; }
             if (w == kLayoutTimer) {
                 if (MotionProgress() >= 1. || !panelVisible_) { StopMotion(); UpdateTooltips(); }
                 else { const RECT content = ContentRect(); InvalidateRect(panel, &content, FALSE); }
@@ -1855,10 +1939,24 @@ private:
             }
             return 0;
         }
+        case kBackdropReady: {
+            std::unique_ptr<box::BackdropResult> result(reinterpret_cast<box::BackdropResult*>(l));
+            if (!result && w == backdropGeneration_) { backdropPending_ = false; pendingBlur_ = -1; }
+            if (result && result->generation == backdropGeneration_) {
+                backdropPending_ = false; pendingBlur_ = -1;
+                RECT rect{}; GetWindowRect(panel, &rect);
+                if (panelVisible_ && backgroundMode_ == 0 && glassTransparency_ && result->value.Matches(rect) &&
+                    result->value.Ready(std::clamp(Px(glassBlur_), 0, 120))) {
+                    backdrop_ = std::move(result->value); customGlass_ = true;
+                    Round(panel); InvalidateRect(panel, nullptr, FALSE);
+                }
+            }
+            return 0;
+        }
         case WM_DPICHANGED:
             if (!isPanel) {
                 dpi_ = HIWORD(w); const auto* suggested = reinterpret_cast<RECT*>(l);
-                const auto grid = box::ReadDesktopGrid(dpi_); cell_ = grid.cell; desktopIconSize_ = grid.iconSize;
+                const auto grid = box::ReadDesktopGrid(dpi_, !nativeMode_); cell_ = grid.cell; desktopIconSize_ = grid.iconSize;
                 MoveAnchor(SnapPosition({suggested->left, suggested->top}, grid), true);
                 LoadAppearance(); Reload();
             }
@@ -1866,13 +1964,13 @@ private:
         case WM_DISPLAYCHANGE:
             if (!isPanel) {
                 RECT rect{}; GetWindowRect(host, &rect);
-                const auto grid = box::ReadDesktopGrid(dpi_); cell_ = grid.cell; desktopIconSize_ = grid.iconSize;
+                const auto grid = box::ReadDesktopGrid(dpi_, !nativeMode_); cell_ = grid.cell; desktopIconSize_ = grid.iconSize;
                 MoveAnchor(SnapPosition({rect.left, rect.top}, grid), true); SavePosition();
                 if (panelVisible_) PositionPanel();
             }
             return 0;
         case WM_SETTINGCHANGE: if (!isPanel) LoadAppearance(); return 0;
-        case WM_DWMCOMPOSITIONCHANGED: if (isPanel) { Round(panel); InvalidateRect(panel, nullptr, FALSE); } return 0;
+        case WM_DWMCOMPOSITIONCHANGED: if (isPanel) { roundedBackdrop_ = 0; roundedDark_ = -1; Round(panel); InvalidateRect(panel, nullptr, FALSE); } return 0;
         case kWake: Reveal(); ShowPanel(); return 0;
         case kFilesChanged: SetTimer(host, kRefreshTimer, 100, nullptr); return 0;
         case kDesktopVisible: {
@@ -1917,7 +2015,9 @@ public:
           activatePanel_(std::move(activatePanel)), owner_(owner) {}
     ~App() {
         removing_ = true;
-        watcher_.Stop(); icons_.Stop();
+        if (panelVisible_) HidePanel();
+        recentBackdrop.ForgetOwner(host);
+        watcher_.Stop(); icons_.Stop(); backdropLoader_.Stop();
         if (IsWindow(host)) DestroyWindow(host);
         if (IsWindow(panel)) DestroyWindow(panel);
         for (HFONT font : {titleFont_, bodyFont_, smallFont_, desktopFont_}) if (font) DeleteObject(font);
@@ -1934,7 +2034,8 @@ public:
         glassTransparency_ = std::clamp(storage.ReadInt(L"GlassTransparency", 55), 0, 100);
         glassBlur_ = std::clamp(storage.ReadInt(L"GlassBlur", 18), 0, 40);
         dpi_ = GetDpiForSystem();
-        const auto grid = box::ReadDesktopGrid(dpi_); cell_ = grid.cell; desktopIconSize_ = grid.iconSize;
+        const auto grid = box::ReadDesktopGrid(dpi_, !(show && attachDesktop)); cell_ = grid.cell; desktopIconSize_ = grid.iconSize;
+        const UINT fontDpi = dpi_;
         LoadAppearance();
         WNDCLASSEXW cls{}; cls.cbSize = sizeof(cls); cls.hInstance = instance_; cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         cls.style = CS_DBLCLKS; cls.lpfnWndProc = HostProc; cls.lpszClassName = kHostClass; cls.hIcon = folderIcon_.value;
@@ -1968,7 +2069,9 @@ public:
         SendMessageW(tooltip_, TTM_SETMAXTIPWIDTH, 0, Px(500));
         SendMessageW(tooltip_, TTM_SETDELAYTIME, TTDT_INITIAL, 400);
         SendMessageW(tooltip_, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
-        LoadAppearance(); Round(host); Round(panel);
+        if (fontDpi != dpi_) LoadAppearance();
+        else { SendMessageW(searchEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE); LayoutSearch(); }
+        Round(host); Round(panel);
         Reload();
         if (!nativeMode_) Check(RenderAnchor());
         hostDrop_ = new DropTarget(this); Check(RegisterDragDrop(host, hostDrop_));
@@ -1979,7 +2082,7 @@ public:
         if (!foregroundHook_) foregroundHook_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, ForegroundEvent,
                                         0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
         if (nativeMode_) {
-            nativeEntry_.Ensure(storage, name_, ExePath());
+            nativeEntry_.Ensure(storage, name_, ExePath(), L"", false, true);
             name_ = storage.Read(L"Name", name_.c_str());
             UpdateNativeBounds();
         } else if (show) {
@@ -1988,16 +2091,20 @@ public:
             UpdateWindow(host); SavePosition();
         }
     }
-    bool ShowPanel() {
+    bool ShowPanel(bool locatedFromHover = false) {
         if (moving_ || inDialog_ || openingPanel_) return false;
+        if (panelVisible_) { CancelClose(); return true; }
         FlagGuard opening(openingPanel_);
         if (activatePanel_ && !activatePanel_(this)) return false;
         CancelClose();
-        if (nativeMode_) UpdateNativeBounds();
-        else if (!IsWindowVisible(host)) ShowWindow(host, SW_SHOWNOACTIVATE);
+        KillTimer(host, kTextCacheTimer); textCacheUntil_ = 0;
+        if (nativeMode_) {
+            if (!locatedFromHover || !nativeLocated_) UpdateNativeBounds();
+        } else if (!IsWindowVisible(host)) ShowWindow(host, SW_SHOWNOACTIVATE);
         PositionPanel(); panelVisible_ = true; QueueVisibleIcons();
         PrepareBackdrop();
         ShowWindow(panel, SW_SHOWNOACTIVATE); InvalidateRect(panel, nullptr, FALSE);
+        UpdateWindow(panel);
         if (owner_) PostMessageW(owner_, kNativeMouse, 0, 0); // Recheck the latest pointer after Shell/backdrop work.
         return true;
     }
@@ -2006,8 +2113,18 @@ public:
         StopMotion(); std::vector<DWORD>().swap(blendScratch_);
         EndMarquee(false); itemPressed_ = addPressed_ = sortPressed_ = false;
         if (GetCapture() == panel) ReleaseCapture();
+        if (panelVisible_) NoteBackdropHide(owner_ ? owner_ : host);
         panelVisible_ = false; nativePointerInside_ = false; hovered_ = -1; ShowWindow(panel, SW_HIDE); CancelClose();
+        ++backdropGeneration_; backdropPending_ = false; pendingBlur_ = -1; backdropLoader_.Stop();
+        RECT screen{}; GetWindowRect(panel, &screen);
+        if (!removing_ && backgroundMode_ == 0 && glassTransparency_ && backdrop_.Matches(screen))
+            recentBackdrop.Retain(std::move(backdrop_), owner_ ? owner_ : host);
         backdrop_.Clear(); customGlass_ = false;
+        panelSurface_.Clear();
+        if (!removing_ && textMasks_.Count()) {
+            textCacheUntil_ = GetTickCount64() + 500;
+            if (!SetTimer(host, kTextCacheTimer, 500, nullptr)) DropTextCache();
+        } else DropTextCache();
         icons_.Clear(); ++generation_;
         const size_t first = static_cast<size_t>(firstRow_ * 4), last = first + static_cast<size_t>(VisibleRows() * 4);
         for (size_t i = 0; i < items_.size(); ++i) {
@@ -2048,6 +2165,7 @@ public:
         return true;
     }
     bool AttachedToDesktop() const { return IsWindow(host) && nativeMode_; }
+    bool NativeReady() const { return AttachedToDesktop() && nativeLocated_; }
     bool NativeIconContains(POINT point) const { return nativeMode_ && nativeLocated_ && PtInRect(&nativeImage_, point); }
     RECT NativeContextBounds() const { return nativeMode_ && nativeLocated_ ? nativeCell_ : RECT{}; }
     void UpdateNativeBounds(bool invalidate = false) {
@@ -2058,12 +2176,16 @@ public:
             if (panelVisible_) InvalidateRect(panel, nullptr, FALSE);
         }
         if (invalidate) nativeEntry_.Invalidate();
+        const RECT previous = nativeCell_;
+        const bool wasLocated = nativeLocated_;
         if (nativeEntry_.Bounds(nativeCell_, nativeImage_)) {
             nativeLocated_ = true;
             cell_ = {nativeCell_.right - nativeCell_.left, nativeCell_.bottom - nativeCell_.top};
-            MoveAnchor({nativeCell_.left, nativeCell_.top}, true);
+            desktopIconSize_ = nativeImage_.right - nativeImage_.left;
+            if (!wasLocated || !EqualRect(&previous, &nativeCell_)) MoveAnchor({nativeCell_.left, nativeCell_.top}, true);
         } else nativeLocated_ = false;
     }
+    void NativeUnavailable() { nativeLocated_ = false; nativeEntry_.Invalidate(); }
     void NativeMouse(POINT point, bool desktop, bool buttonDown) {
         const bool overIcon = desktop && NativeIconContains(point);
         RECT panelRect{}; if (panelVisible_) GetWindowRect(panel, &panelRect);
@@ -2071,7 +2193,7 @@ public:
         if (inside) CancelClose();
         else if (nativePointerInside_) ScheduleClose();
         nativePointerInside_ = inside;
-        if (overIcon && !buttonDown && !panelVisible_ && !inMenu_ && !inDialog_) ShowPanel();
+        if (overIcon && !buttonDown && !panelVisible_ && !inMenu_ && !inDialog_) ShowPanel(true);
     }
     void Reveal() {
         if (!IsWindow(host) || removing_) return;
@@ -2089,6 +2211,7 @@ public:
         if (panelVisible_) PositionPanel();
     }
     void Refresh() { Reload(); }
+    void WarmIcons() { if (!panelVisible_) QueueVisibleIcons(true); }
     void RefreshAppearance() { ReloadAppearance(); }
     void Appearance(const AppearanceCommit& commit = {}, const AppearanceSettings* initial = nullptr) { ChooseAppearance(commit, initial); }
     void AppendHoverDiagnostics(std::wstring& text) const {
@@ -2167,6 +2290,8 @@ class Manager {
     bool trayCustomIcon_ = false;
     UINT taskbarCreated_ = 0;
     int desktopRetries_ = 0;
+    ULONGLONG desktopRetryStarted_ = 0, desktopRetryDeadline_ = 0;
+    ULONGLONG mouseReadyAt_ = 0, desktopReadyAt_ = 0, createdAt_ = GetTickCount64();
     ULONG desktopNotifications_ = 0;
     box::DesktopMouse mouse_;
     ULONGLONG lastNativeRefresh_ = 0, lastSurfaceRefresh_ = 0;
@@ -2183,6 +2308,26 @@ class Manager {
         for (const auto& box : boxes_) if (box.get() != requested && !box->CanYieldPanel()) return false;
         for (const auto& box : boxes_) if (box.get() != requested && box->PanelVisible()) box->HidePanel();
         return true;
+    }
+    void BeginDesktopRetry() {
+        desktopRetries_ = 0; desktopRetryStarted_ = GetTickCount64(); desktopReadyAt_ = 0;
+        desktopRetryDeadline_ = desktopRetryStarted_ + 60000;
+        SetTimer(controller_, kDesktopTimer, 100, nullptr);
+    }
+    bool DesktopReady() const {
+        return IsWindow(desktopSurface_) && std::all_of(boxes_.begin(), boxes_.end(), [](const auto& box) { return box->NativeReady(); });
+    }
+    void RetryDesktop() {
+        RestoreDesktop(); RefreshNative(true); NativePointer(false);
+        const ULONGLONG now = GetTickCount64();
+        if (DesktopReady() || !desktopRetryDeadline_ || now >= desktopRetryDeadline_) {
+            KillTimer(controller_, kDesktopTimer); desktopRetryDeadline_ = 0;
+            if (DesktopReady()) desktopReadyAt_ = now;
+        } else {
+            ++desktopRetries_;
+            const ULONGLONG elapsed = now - desktopRetryStarted_;
+            SetTimer(controller_, kDesktopTimer, elapsed < 2000 ? 100 : elapsed < 10000 ? 250 : 1000, nullptr);
+        }
     }
     void PublishContextTargets() {
         std::vector<box::DesktopContextTarget> targets;
@@ -2236,7 +2381,10 @@ class Manager {
     }
     void RefreshNative(bool invalidate = false) {
         desktopSurface_ = box::DesktopSurface();
-        for (auto& box : boxes_) box->UpdateNativeBounds(invalidate);
+        for (auto& box : boxes_) {
+            if (desktopSurface_) box->UpdateNativeBounds(invalidate);
+            else box->NativeUnavailable();
+        }
         PublishContextTargets();
         lastSurfaceRefresh_ = lastNativeRefresh_ = GetTickCount64();
     }
@@ -2400,6 +2548,10 @@ class Manager {
             L"\r\nlast_pointer_age_ms=" + std::to_wstring(GetTickCount64() - lastPointerCheck_) +
             L"\r\nmenu_open=" + std::to_wstring(contextMenuOpen_) + L"\r\ndesktop_surface=" + std::to_wstring(IsWindow(desktopSurface_)) +
             L"\r\ntray_custom_icon=" + std::to_wstring(trayCustomIcon_) +
+            L"\r\nmouse_ready_ms=" + std::to_wstring(mouseReadyAt_ ? mouseReadyAt_ - createdAt_ : 0) +
+            L"\r\ndesktop_ready_ms=" + std::to_wstring(desktopReadyAt_ ? desktopReadyAt_ - createdAt_ : 0) +
+            L"\r\ndesktop_retry_pending=" + std::to_wstring(desktopRetryDeadline_ != 0) +
+            L"\r\ndesktop_retry_attempts=" + std::to_wstring(desktopRetries_) +
             L"\r\ncursor=" + std::to_wstring(point.x) + L"," + std::to_wstring(point.y) + L"\r\non_desktop=" + std::to_wstring(OnDesktop(point)) +
             L"\r\nwindow_under_cursor=" + underClass + L"\r\nforeground_window=" + foregroundClass +
             L"\r\nshell_gui_flags=" + std::to_wstring(gui.flags) + L"\r\nsettle_pending=" + std::to_wstring(pointerSettlePending_) + L"\r\n";
@@ -2460,8 +2612,11 @@ class Manager {
         for (const auto& directory : retry) Attach(directory);
     }
     LRESULT Handle(UINT message, WPARAM w, LPARAM l) {
-        if (taskbarCreated_ && message == taskbarCreated_) { Tray(); desktopRetries_ = 30; SetTimer(controller_, kDesktopTimer, 1000, nullptr); return 0; }
+        if (taskbarCreated_ && message == taskbarCreated_) { Tray(); BeginDesktopRetry(); return 0; }
         switch (message) {
+        case kCompleteBackdropHide: FlushBackdropHide(); return 0;
+        case kCompleteShellSetup: UpdateShellIntegration(); return 0;
+        case kWarmIcons: for (const auto& box : boxes_) box->WarmIcons(); return 0;
         case WM_INPUT:
             mouse_.HandleRawInput(l);
             return DefWindowProcW(controller_, message, w, l); // Windows must clean up foreground raw-input messages.
@@ -2510,15 +2665,13 @@ class Manager {
             return 0;
         }
         case WM_TIMER:
+            if (w == kBackdropCacheTimer) { recentBackdrop.Expire(controller_); return 0; }
             if (w == kPointerSettleTimer) { SettlePointer(); return 0; }
             if (w == kNativeRefreshTimer) {
                 KillTimer(controller_, kNativeRefreshTimer); RefreshNative(true); NativePointer(false); return 0;
             }
             if (w == kDesktopTimer) {
-                RestoreDesktop();
-                RefreshNative(true);
-                const bool attached = std::all_of(boxes_.begin(), boxes_.end(), [](const auto& box) { return box->AttachedToDesktop(); });
-                if (attached || --desktopRetries_ <= 0) KillTimer(controller_, kDesktopTimer);
+                RetryDesktop();
             }
             return 0;
         case WM_DISPLAYCHANGE: case WM_SETTINGCHANGE:
@@ -2555,6 +2708,7 @@ public:
     Manager(HINSTANCE instance, std::wstring root, std::wstring icons)
         : instance_(instance), root_(std::move(root)), icons_(std::move(icons)), journal_(root_ + L"\\origins") {}
     ~Manager() {
+        recentBackdrop.ForgetOwner(controller_);
         if (desktopNotifications_) SHChangeNotifyDeregister(desktopNotifications_);
         mouse_.Stop();
         boxes_.clear();
@@ -2580,8 +2734,13 @@ public:
         WNDCLASSEXW cls{}; cls.cbSize = sizeof(cls); cls.hInstance = instance_; cls.lpfnWndProc = WindowProc; cls.lpszClassName = kControllerClass;
         if (!RegisterClassExW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) throw HRESULT_FROM_WIN32(GetLastError());
         Check(CreateWindowExW(0, kControllerClass, kTitle, WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance_, this) ? S_OK : HRESULT_FROM_WIN32(GetLastError()));
+        taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
+        if (integrateUser_) {
+            desktopSurface_ = box::DesktopSurface();
+            Check(mouse_.Start(controller_, kNativeMouse, kNativeContext)); mouseReadyAt_ = GetTickCount64();
+        }
         RefreshTrayIcon();
-        taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated"); if (integrateUser_) Tray();
+        if (integrateUser_) Tray();
         Attach(root_);
         WIN32_FIND_DATAW found{}; HANDLE search = FindFirstFileW((root_ + L"\\boxes\\*").c_str(), &found);
         if (search != INVALID_HANDLE_VALUE) {
@@ -2594,12 +2753,12 @@ public:
             FindClose(search);
         }
         if (!integrateUser_) return;
-        desktopRetries_ = 30; SetTimer(controller_, kDesktopTimer, 1000, nullptr);
-        desktopSurface_ = box::DesktopSurface();
-        Check(mouse_.Start(controller_, kNativeMouse, kNativeContext));
+        BeginDesktopRetry();
         RefreshNative(true);
         NativePointer();
-        UpdateShellIntegration();
+        if (DesktopReady()) { desktopReadyAt_ = GetTickCount64(); KillTimer(controller_, kDesktopTimer); desktopRetryDeadline_ = 0; }
+        PostMessageW(controller_, kCompleteShellSetup, 0, 0);
+        PostMessageW(controller_, kWarmIcons, 0, 0);
         PIDLIST_ABSOLUTE desktop = nullptr;
         if (SUCCEEDED(SHGetKnownFolderIDList(FOLDERID_Desktop, 0, nullptr, &desktop))) {
             SHChangeNotifyEntry entry{desktop, TRUE};

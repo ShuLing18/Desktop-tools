@@ -39,18 +39,29 @@ int PerformanceTest(const std::wstring& directory) {
         pump(); sample("initialized");
         LARGE_INTEGER frequency{}, started{}, finished{}; QueryPerformanceFrequency(&frequency);
         LONGLONG renderTicks = 0;
+        std::vector<double> firstFrameMs, reopenMs, settledReopenMs, hotReopenMs, glassReadyMs, captureMs, flushMs, blurMs;
+        auto openAndMeasure = [&](App& box, std::vector<double>& times) {
+            LARGE_INTEGER begin{}, end{}; QueryPerformanceCounter(&begin);
+            Check(box.ShowPanel() ? S_OK : E_FAIL);
+            UpdateWindow(box.panel);
+            QueryPerformanceCounter(&end);
+            times.push_back(1000. * (end.QuadPart - begin.QuadPart) / frequency.QuadPart);
+        };
         for (const auto& box : manager.boxes_) {
-            box->ShowPanel();
+            LARGE_INTEGER glassStarted{}; QueryPerformanceCounter(&glassStarted);
+            openAndMeasure(*box, firstFrameMs);
             const auto deadline = GetTickCount64() + 10000;
             bool ready = false;
             do {
                 pump();
-                ready = true;
+                ready = !box->backdropPending_;
                 const size_t count = std::min(box->items_.size(), static_cast<size_t>(box->VisibleRows() * 4));
                 for (size_t i = 0; i < count; ++i) ready = ready && box->items_[i].icon.value;
                 if (!ready) Sleep(1);
             } while (!ready && GetTickCount64() < deadline);
             if (!ready) throw HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            QueryPerformanceCounter(&finished);
+            glassReadyMs.push_back(1000. * (finished.QuadPart - glassStarted.QuadPart) / frequency.QuadPart);
             HDC screen = GetDC(box->panel); QueryPerformanceCounter(&started);
             HRESULT rendered = S_OK;
             for (int frame = 0; frame < 12 && SUCCEEDED(rendered); ++frame) rendered = box->RenderSurface(box->panel, true, screen);
@@ -58,8 +69,48 @@ int PerformanceTest(const std::wstring& directory) {
             renderTicks += finished.QuadPart - started.QuadPart;
             sample("panel_open"); box->HidePanel();
         }
-        pump(); sample("all_panels_closed");
-        report += "\n  ],\n  \"render_60_frames_ms\": " + std::to_string(1000. * renderTicks / frequency.QuadPart) + "\n}\n";
+        for (int cycle = 0; cycle < 3; ++cycle) for (const auto& box : manager.boxes_) {
+            openAndMeasure(*box, reopenMs); pump(); box->HidePanel();
+        }
+        for (int cycle = 0; cycle < 3; ++cycle) for (const auto& box : manager.boxes_) {
+            pump(); openAndMeasure(*box, settledReopenMs); pump(); box->HidePanel(); pump();
+        }
+        for (const auto& box : manager.boxes_) {
+            Check(box->ShowPanel() ? S_OK : E_FAIL);
+            const auto deadline = GetTickCount64() + 5000;
+            while (box->backdropPending_ && GetTickCount64() < deadline) { pump(); Sleep(1); }
+            if (box->backdropPending_) throw HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            for (int cycle = 0; cycle < 3; ++cycle) { box->HidePanel(); openAndMeasure(*box, hotReopenMs); pump(); }
+            box->HidePanel(); pump();
+        }
+        sample("all_panels_closed");
+        const auto cacheDeadline = GetTickCount64() + 2500;
+        auto cachePending = [&] { return recentBackdrop.Bytes() || std::any_of(manager.boxes_.begin(), manager.boxes_.end(), [](const auto& box) { return box->textCacheUntil_ != 0; }); };
+        while (cachePending() && GetTickCount64() < cacheDeadline) { pump(); Sleep(1); }
+        if (cachePending()) throw HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        pump(); sample("idle_after_cache_expiry");
+        RECT captureRect{}; GetWindowRect(manager.boxes_.front()->panel, &captureRect);
+        for (int probe = 0; probe < 5; ++probe) {
+            box::Backdrop capture;
+            QueryPerformanceCounter(&started); DwmFlush(); QueryPerformanceCounter(&finished);
+            flushMs.push_back(1000. * (finished.QuadPart - started.QuadPart) / frequency.QuadPart);
+            QueryPerformanceCounter(&started); Check(capture.Capture(captureRect) ? S_OK : E_FAIL); QueryPerformanceCounter(&finished);
+            captureMs.push_back(1000. * (finished.QuadPart - started.QuadPart) / frequency.QuadPart);
+            QueryPerformanceCounter(&started); Check(capture.Blur(manager.boxes_.front()->Px(18)) ? S_OK : E_FAIL); QueryPerformanceCounter(&finished);
+            blurMs.push_back(1000. * (finished.QuadPart - started.QuadPart) / frequency.QuadPart);
+        }
+        report += "\n  ],\n  \"render_60_frames_ms\": " + std::to_string(1000. * renderTicks / frequency.QuadPart);
+        auto addTimes = [&](const char* name, const std::vector<double>& times) {
+            report += ",\n  \"" + std::string(name) + "\": [";
+            for (size_t i = 0; i < times.size(); ++i) { if (i) report += ", "; report += std::to_string(times[i]); }
+            report += "]";
+        };
+        addTimes("first_frame_ms", firstFrameMs); addTimes("reopen_first_frame_ms", reopenMs);
+        addTimes("settled_reopen_first_frame_ms", settledReopenMs);
+        addTimes("same_box_rapid_reopen_ms", hotReopenMs);
+        addTimes("glass_and_icons_ready_ms", glassReadyMs);
+        addTimes("capture_probe_ms", captureMs); addTimes("composition_flush_probe_ms", flushMs); addTimes("blur_probe_ms", blurMs);
+        report += "\n}\n";
     } catch (...) { result = 1; report += "\n  ],\n  \"error\":true\n}\n"; }
     if (!WriteBytes(directory + L"\\metrics.json", report.data(), static_cast<DWORD>(report.size()))) return 2;
     return result;

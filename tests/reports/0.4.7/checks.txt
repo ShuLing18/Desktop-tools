@@ -1,0 +1,282 @@
+PASS right/bottom edge opens left and remains on screen
+PASS preferred direction falls back at left edge
+PASS negative-coordinate monitor and 150 percent geometry
+PASS small work area clamps panel dimensions
+PASS upward expansion places the panel above the desktop icon with the configured gap
+PASS downward expansion places the panel below the desktop icon
+PASS upward expansion falls back below the icon at the top edge
+PASS downward expansion falls back above the icon at the bottom edge
+PASS automatic expansion uses vertical room when neither horizontal side fits
+PASS Ctrl click adds separate selected items
+PASS Ctrl click on a selected item removes only that item
+PASS successive reverse Shift ranges keep their original anchor and shrink correctly
+PASS Ctrl Shift extends the range without discarding other selections
+PASS keyboard focus can move independently of the selected set
+PASS Ctrl marquee toggles against its initial set without flickering on repeated updates
+PASS Shift marquee adds intersecting items to the initial set
+PASS plain marquee replaces the previous selected set
+PASS select all includes every item and ignores invalid indexes
+PASS empty containers safely accept selection and keyboard commands
+PASS group reorder moves separated items to the end while retaining relative order
+PASS group reorder moves separated items before the first item
+PASS dropping a group onto one of its own items leaves its order intact
+PASS disconnected monitor anchor is clamped
+PASS desktop anchor snaps to nearest grid cell
+PASS desktop grid avoids an occupied native icon cell
+PASS grid snapping supports negative monitor coordinates and 150 percent cells
+PASS reserved names and invalid filename characters
+PASS short settings and normalized paths do not retain 64 KB allocations per string
+PASS adaptive settings buffers preserve long Unicode values exactly
+PASS compact path buffers preserve paths exceeding MAX_PATH without truncation
+PASS line-sized blur scratch matches the old full-frame algorithm pixel for pixel across sizes and strengths
+PASS multiple box icon loaders share exactly one background worker
+PASS shared worker delivers separate generations and icons to the correct box windows
+PASS closing or restarting one icon client leaves the other working and rejects late results for a reused window
+PASS the shared icon thread and queue are released after the last client closes
+PASS an empty box does not create an idle icon worker
+PASS a closed box keeps its current visible icons while releasing offscreen icons without dropping files
+PASS fully opaque glass preserves the opaque background without allocating screenshot or blur buffers
+PASS making glass transparent again restores real capture and blur
+PASS switching from glass to a solid background releases existing backdrop memory immediately
+PASS mouse recovery coalesces input into one pending final position check
+PASS final mouse recovery refreshes the desktop and rechecks a stationary pointer without another movement
+PASS completed mouse recovery does not leave an idle polling timer or repeat a stale timer message
+PASS background jobs share immutable capture pixels safely after the original owner releases them
+PASS cancelled background calculations stop without publishing incomplete pixels
+PASS backdrop identity includes the screen origin so moving a same-sized panel cannot reuse stale glass
+PASS a reusable native paint surface is allocated successfully
+PASS repeated frames reuse their bitmap and DC instead of allocating GDI objects each time
+PASS paint buffers adapt to a changed panel size without retaining obsolete dimensions
+PASS closing a panel releases the reusable native paint surface
+PASS opening draws a real first frame without waiting for background blur or asynchronous file icons
+PASS the completed asynchronous glass frame replaces the initial native backdrop without reopening the window
+PASS reopening an already visible box keeps its existing background job and paint resources
+PASS Unicode file labels retain real antialiased glyph coverage in the bounded cache
+PASS cached filename coverage remains identical while repeated drawing avoids glyph regeneration
+PASS cropped cached glyphs match the original full-size GDI mask pixel for pixel
+PASS filename masks stay under their fixed memory and entry limits during repeated searching
+PASS rapid blur preview changes publish only the latest requested strength
+PASS hiding cancels background work, releases the paint buffer and keeps only bounded short-lived text and glass caches
+PASS the text-cache expiry releases glyph masks and their scratch DC completely
+PASS a delayed backdrop completion cannot revive a closed panel or attach pixels to a newer generation
+PASS switching to a solid background cancels outstanding blur and retains the selected native appearance
+PASS startup warms only the bounded first page of real file icons in the background without showing a panel
+PASS hover uses its verified native icon geometry without blocking on another Explorer lookup or showing a duplicate entrance
+PASS the real hover path receives its complete background before a rapid reopen
+PASS rapid reopen retains only one backdrop within the fixed 4 MiB budget
+PASS a same-position rapid reopen consumes the exact previous image without a capture, blur or full-frame copy
+PASS an already queued text-cache timer cannot clear the glyphs of a reopened visible panel
+PASS hiding a panel records that its composed frame must clear before another background capture
+PASS the one-shot hide completion moves composition waiting out of the next settled hover
+PASS a stale cache timer cannot evict a newly retained frame early
+PASS the half-second one-shot deadline releases retained background memory completely
+PASS large high-DPI captures bypass the rapid-reopen cache instead of exceeding its memory budget
+PASS one hundred actual open paint close cycles leave no accumulating GDI buffers or filename caches
+PASS native-entry startup obtains DPI-aware metrics without enumerating the entire Explorer desktop
+PASS a created owner window is not mistaken for a fully located native desktop icon at logon
+PASS desktop readiness retries begin immediately with a bounded recovery window
+PASS startup recovery stops its timer after the deadline instead of polling forever
+PASS create Unicode source fixture
+PASS file itself moves into shelf; no shortcut created
+PASS original absolute path is journaled
+PASS moved file retains original bytes
+PASS same-name files are both kept and have separate origins
+PASS existing shortcut itself is moved with arguments preserved
+PASS folder and nested file move intact
+PASS URL file itself moves into shelf
+PASS ICO imported into dedicated library and selected without depending on external source
+PASS invalid ICO leaves current icon unchanged
+PASS settings icon preview imports its asset without changing the saved icon selection
+PASS ICO library survives removal of external uploaded file
+PASS custom ICO adapts to a 150 percent display size
+PASS name, position, ICO selection and origins persist across fresh storage instance
+PASS multiple boxes keep independent names and settings
+PASS moving between boxes preserves first original location
+PASS deleting second box restores item to first original location
+PASS delete-box restore returns every file/folder/link to its own original location
+PASS occupied original path keeps both files instead of overwriting
+PASS restore conflict preserves both original payloads byte-for-byte
+PASS unknown-origin content prevents silent deletion
+PASS explicit return folder recovers untracked content
+PASS restore recreates a removed original parent folder
+PASS cross-volume move transfers actual file and preserves bytes
+PASS cross-volume restore returns file to original drive
+PASS moving shelf into itself is rejected before any move
+PASS deleted-box state persists across restart
+PASS native desktop shortcut launches its own box and accepts dropped original file paths
+PASS native Windows icon uses the persisted ICO library file
+PASS simulate an Explorer rename of native desktop entry
+PASS Windows file rename synchronizes box title and persistent name
+PASS restart reuses native desktop entry instead of creating a duplicate
+PASS startup leaves a correctly configured native shortcut untouched instead of rewriting it and refreshing Explorer
+PASS launcher path casing does not create a duplicate desktop entry
+PASS deleting a box removes only its owned native entry
+PASS same-name boxes receive separate native desktop entries
+PASS restart and icon refresh reuse the numbered desktop entry without renaming it
+PASS explicit rename still changes an owned numbered desktop entry
+PASS background mode, glass transparency and blur persist across reload
+PASS cancelled external drag retains original-location journal
+PASS external move preserves bytes and retires only the departed item's origin
+PASS native file rename preserves original location using Windows file identity
+PASS renamed item still restores to its original filename and folder
+PASS Windows Shell supplies real Copy and Properties commands for a stored shortcut
+PASS Shell multi-selection rejects unrelated parent folders instead of binding wrong items
+PASS batch import moves original files a shortcut and a folder into one container
+PASS native drag data carries every selected original path without creating shortcuts
+PASS Windows supplies real batch Copy Cut and Delete commands for the complete selected set
+PASS batch move out preserves file bytes shortcut parameters and nested folder contents
+PASS zero glass blur preserves background detail exactly
+PASS higher glass blur measurably reduces background contrast
+PASS zero transparency produces an opaque tint without changing text opacity
+PASS full transparency reveals the independently blurred background
+PASS closing glass panel releases its background buffers
+PASS layered anchor submits successfully before first WM_PAINT
+PASS transparent anchor retains visible Windows folder icon
+PASS transparent anchor retains readable box name
+PASS transparent anchor retains item-count badge
+PASS anchor edges have no opaque white card or border
+PASS anchor uses Windows desktop icon font and size
+PASS text keeps smooth premultiplied alpha edges without an opaque black fringe
+PASS custom ICO stays visible on transparent anchor after appearance refresh
+PASS closing only the content panel leaves the desktop entrance visible
+PASS close message no longer hides the desktop entrance
+PASS internal drag reorders persist without moving or changing file contents
+PASS long filename tooltip exposes the complete untruncated name
+PASS Fluent dialog binds saved values to native controls with unchanged options and ranges
+PASS slider notifications update actual preview values and badges without committing settings
+PASS solid background disables glass controls without discarding either parameter
+PASS styled dialog retains native default and cancel buttons for dialog keyboard handling
+PASS desktop mouse listener rejects an invalid owner without creating a thread
+PASS desktop mouse hook installs on a live thread separate from the Shell and UI thread
+PASS mouse monitoring independently registers background Raw Input
+PASS Raw Input routes background mouse events to the application window without disabling ordinary mouse messages
+PASS a stalled hook can request recovery on its own listener thread
+PASS hook recovery completes without restarting the program or its interface
+PASS a cached icon under another window cannot intercept right clicks
+PASS right click callback reads only a UI approved cached icon region
+PASS a foreground window change invalidates cached desktop right click approval
+PASS concurrent snapshot publication and callback hit testing finish while the UI is not pumping messages
+PASS desktop mouse listener joins and removes its hook before its owner is destroyed
+PASS background mouse monitoring remains available with no low level hook installed
+PASS Raw Input wakes hover without a hook and coalesces a burst into one pending UI notification
+PASS Raw Input independently refreshes native icon geometry after a button release
+PASS invalid raw input data does not notify or corrupt listener state
+PASS stopping mouse monitoring unregisters its raw device and joins its worker
+PASS covered desktop icon never opens a panel through another window
+PASS blank grid space beside the native icon does not trigger hover
+PASS dragging a native desktop icon does not open its panel
+PASS native icon hover opens immediately without any tray action
+PASS saved upward direction is loaded without being clamped to the old left right range
+PASS downward direction command updates the actual layout setting and persists it
+PASS manual sorting reads the saved item order
+PASS A to Z sorting uses real names with natural numeric ordering
+PASS sorting preserves selection by file identity rather than old grid indexes
+PASS time sorting uses actual last write timestamps from newest to oldest
+PASS a fresh container instance restores both sorting and vertical expansion settings
+PASS returning to manual sorting restores the saved drag order
+PASS internal group drop is handled as reorder rather than a physical file move
+PASS internal group drag persists relative order and retains the complete selected group
+PASS manual dragging after automatic sorting switches to persisted manual order
+PASS single click selects a file while leaving the panel open
+PASS Ctrl click through native mouse messages adds another file without opening it
+PASS pressing a selected file retains the entire group for a potential drag
+PASS releasing a plain click collapses the selected group to its clicked item
+PASS blank space drag displays a marquee and selects all intersected tiles without closing
+PASS native renderer exports the live selection rectangle for visual inspection
+PASS finishing a marquee releases capture and keeps its selected set
+PASS native renderer exports selected checkmarks count and sorting button for visual inspection
+PASS reverse direction marquee selects the same intersecting files
+PASS Ctrl marquee toggles only the intersected selected tile
+PASS Escape cancels a live marquee and restores its original selection
+PASS refresh retains all selected surviving files and all bytes after sorting and group reorder
+PASS marquee edge scrolling extends selection into rows beyond the initial viewport
+PASS marquee scroll timer stops after release while retaining files from earlier rows
+PASS native search edit filters only this box and preserves every hidden file in memory
+PASS select all under search includes only visible results
+PASS drag reordering filtered results swaps their real saved order
+PASS Escape clears native search and restores all hidden items while retaining their positions around a filtered reorder
+PASS zero search results clear hidden selections without deleting or moving files
+PASS directory refresh while filtering retains every file and restores the same complete order
+PASS sorting maps each surviving file identity from its old visible coordinates to the new grid
+PASS native renderer exports a real intermediate sorting animation frame
+PASS search animates surviving cards and retains outgoing cards for a short fade
+PASS animated cards remain hit testable at their displayed positions and export a real search frame
+PASS a new query continues the current on screen position and bounds outgoing icon memory
+PASS finished animation stops its timer and releases outgoing icons
+PASS native renderer exports the completed local search layout
+PASS hiding the panel stops motion and releases all temporary animation buffers
+PASS search matches Chinese and case insensitive terms including extensions and ignores empty whitespace
+PASS search excludes files that do not match every term
+PASS layout motion starts at the old coordinates interpolates between them and finishes exactly at the new coordinates
+PASS layout easing is monotonic and clamps finished or zero length animations
+PASS right clicking an owned native desktop icon selects its management menu and releases the click pair
+PASS each native desktop entrance routes its right click to its own box
+PASS blank desktop and unrelated icons keep their Windows context menu
+PASS a window covering an owned desktop icon is never intercepted
+PASS moving away during a right click cancels its menu without leaving a captured button
+PASS per user ShellNew registration names the native New submenu entry Desktop Storage Box
+PASS ShellNew launches the application with correctly quoted Unicode executable and data paths
+PASS New submenu and file association use the selected ICO icon
+PASS ShellNew runs a creation command without leaving an empty placeholder file
+PASS repeated automatic Shell registration does not rewrite values or trigger unnecessary Explorer refreshes
+PASS uninstalling an old executable preserves a newer installation registration
+PASS uninstaller removes only its owned ShellNew and ProgID keys
+PASS automatic registration refuses to replace a foreign file association
+PASS the tray menu excludes rename delete move-in and open-current-folder commands belonging to one box
+PASS the tray menu offers explicitly global settings together with create startup refresh-all and exit
+PASS mixed individual expansion directions do not show a misleading single-box checkmark in the tray
+PASS the tray command router ignores per-box rename and delete commands
+PASS actual global settings dialog identifies all boxes and binds the edited values
+PASS confirming tray settings updates every existing box icon background opacity and blur in memory and on disk
+PASS global ICO selection updates the actual notification-area icon pixels
+PASS global appearance leaves files names expansion direction and sorting intact
+PASS tray expansion direction applies to every box in memory and on disk
+PASS the tray direction checkmark represents a setting shared by all boxes
+PASS an individual expansion direction remains separate from other boxes and global defaults
+PASS a new box inherits all globally saved appearance values
+PASS a new box inherits the globally saved expansion direction
+PASS actual individual settings dialog identifies one box and binds its edited values
+PASS individual ICO settings only change the selected box and preserve other boxes and global defaults
+PASS changing one box ICO leaves the taskbar icon on the global ICO
+PASS actual global settings dialog identifies all boxes and binds the edited values
+PASS cancelling global background and default-icon previews preserves every box and new-box defaults
+PASS actual global settings dialog identifies all boxes and binds the edited values
+PASS global Restore Default resets all box ICOs including a previously customized individual box
+PASS global Restore Default also restores the Windows folder taskbar icon
+PASS an explicit empty global ICO default is not replaced by a later individual icon on the default box
+PASS tray Refresh All reloads the content of every box
+PASS a full manager restart restores global appearance and the separately customized individual ICO
+PASS a full manager restart restores global expansion defaults and the individual direction override
+PASS global defaults can be saved with no boxes without recreating a deleted box
+PASS the same global tray menu remains available after the last box is deleted
+PASS the first box created after deleting all boxes inherits the global appearance
+PASS global expansion direction set with no boxes is inherited by the first newly created box
+PASS ShellNew IPC accepts the current data root and defers creation until after replying to Explorer
+PASS accepted ShellNew IPC posts exactly one asynchronous creation request
+PASS ShellNew creates a separate persistent storage box using the saved ICO and leaves original contents intact
+PASS a creation request for a different data directory is rejected without making a box
+PASS running instance reports live hover and menu state without opening or closing panels
+PASS showing a managed box opens exactly one panel
+PASS switching boxes hides the old panel before preparing the new one and cancels its delayed close
+PASS rapid repeated box switching never leaves two expanded panels
+PASS reentrant hover during Shell or backdrop preparation cannot start a second panel
+PASS hovering another box cannot interrupt an active context menu
+PASS hovering another box cannot interrupt an active settings or file dialog
+PASS box switching preserves an active selection gesture and mouse capture
+PASS an active drop target remains open until the drag leaves
+PASS a file drag may reveal another box without cancelling its source operation
+PASS pointer leave schedules panel closing after 120 milliseconds instead of 380
+PASS duplicate leave events do not keep extending the close deadline
+PASS a stale timer cannot close a newly scheduled panel early
+PASS entering the panel before timeout keeps its controls accessible
+PASS leaving both icon and panel closes the actual window at the shortened deadline
+PASS an already queued close timer cannot dismiss a context menu's panel
+PASS a ShellNew box and its selected ICO are restored by the manager after a complete restart
+PASS narrow left and right transit gaps preserve movement from an icon into its panel
+PASS upward and downward expansion also preserve their narrow transit gap
+PASS panel transit never turns surrounding blank space or diagonal regions into hover targets
+PASS startup executable paths are XML-escaped
+PASS login startup has no configured delay idle or network gate and preserves the selected data directory
+PASS login task XML validates without registering a task
+
+All 280 checks passed.

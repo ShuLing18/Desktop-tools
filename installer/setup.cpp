@@ -155,7 +155,7 @@ void RegisterUninstaller(const std::wstring& folder) {
                                      KEY_READ | KEY_WRITE, nullptr, &key.value, nullptr);
     if (result != ERROR_SUCCESS) Fail(L"无法注册卸载程序", result);
     WriteRegistry(key.value, L"DisplayName", kName);
-    WriteRegistry(key.value, L"DisplayVersion", L"0.4.6");
+    WriteRegistry(key.value, L"DisplayVersion", L"0.4.7");
     WriteRegistry(key.value, L"Publisher", L"DesktopBox");
     WriteRegistry(key.value, L"InstallLocation", folder);
     WriteRegistry(key.value, L"DisplayIcon", folder + L"\\" + kExe);

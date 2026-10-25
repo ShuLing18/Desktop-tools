@@ -111,7 +111,7 @@
     expect(cache.customGlass_ && !cache.acrylic_ && !cache.backdrop_.Matches(rect.right, rect.bottom),
            "fully opaque glass preserves the opaque background without allocating screenshot or blur buffers");
     cache.glassTransparency_ = 55; cache.ApplyAppearance();
-    expect(cache.customGlass_ && cache.backdrop_.Matches(rect.right, rect.bottom), "making glass transparent again restores real capture and blur");
+    expect(waitForBackdrop(cache) && cache.backdrop_.Matches(rect.right, rect.bottom), "making glass transparent again restores real capture and blur");
     cache.backgroundMode_ = 2; cache.ApplyAppearance();
     expect(!cache.customGlass_ && !cache.backdrop_.Matches(rect.right, rect.bottom), "switching from glass to a solid background releases existing backdrop memory immediately");
 }

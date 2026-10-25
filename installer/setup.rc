@@ -1,9 +1,9 @@
 #include <windows.h>
 1 RT_MANIFEST "installer/setup.manifest"
-201 RCDATA "build/DesktopBox-0.4.6.exe"
+201 RCDATA "build/DesktopBox-0.4.7.exe"
 1 VERSIONINFO
-FILEVERSION 0,4,6,0
-PRODUCTVERSION 0,4,6,0
+FILEVERSION 0,4,7,0
+PRODUCTVERSION 0,4,7,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -13,7 +13,7 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "桌面收纳盒安装程序\0"
       VALUE "ProductName", "DesktopBox Setup\0"
-      VALUE "FileVersion", "0.4.6\0"
+      VALUE "FileVersion", "0.4.7\0"
     END
   END
   BLOCK "VarFileInfo"

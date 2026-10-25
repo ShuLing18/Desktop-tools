@@ -10,7 +10,7 @@ struct DesktopGrid {
     int iconSize = 0;
     std::vector<RECT> occupied;
 };
-DesktopGrid ReadDesktopGrid(UINT dpi);
+DesktopGrid ReadDesktopGrid(UINT dpi, bool includeOccupied = true);
 class WindowDpiScope {
     DPI_AWARENESS_CONTEXT previous_ = nullptr;
 public:

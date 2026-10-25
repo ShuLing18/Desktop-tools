@@ -40,8 +40,8 @@ BEGIN
 END
 1 RT_MANIFEST "resources/app.manifest"
 1 VERSIONINFO
-FILEVERSION 0,4,6,0
-PRODUCTVERSION 0,4,6,0
+FILEVERSION 0,4,7,0
+PRODUCTVERSION 0,4,7,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -51,7 +51,7 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "桌面收纳盒\0"
       VALUE "ProductName", "DesktopBox\0"
-      VALUE "FileVersion", "0.4.6\0"
+      VALUE "FileVersion", "0.4.7\0"
     END
   END
   BLOCK "VarFileInfo"

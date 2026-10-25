@@ -19,6 +19,15 @@ int SelfTest(const std::wstring& directory) {
         report += std::string(ok ? "PASS " : "FAIL ") + description + "\r\n";
         ++total; if (!ok) throw std::runtime_error(description);
     };
+    auto waitForBackdrop = [](App& app) {
+        const auto deadline = GetTickCount64() + 5000;
+        while (app.backdropPending_ && GetTickCount64() < deadline) {
+            MSG message{};
+            while (PeekMessageW(&message, app.host, kBackdropReady, kBackdropReady, PM_REMOVE)) DispatchMessageW(&message);
+            if (app.backdropPending_) Sleep(1);
+        }
+        return !app.backdropPending_ && app.customGlass_;
+    };
     int result = 0;
     try {
         EnsureDirectory(directory);
@@ -89,6 +98,7 @@ int SelfTest(const std::wstring& directory) {
         const auto sandbox = directory + L"\\run-" + std::to_wstring(GetTickCount64()); EnsureDirectory(sandbox);
         Storage storage(sandbox + L"\\data");
 #include "optimization_checks.inc"
+#include "responsiveness_checks.inc"
         const auto source = sandbox + L"\\测试文件.txt";
         expect(WriteBytes(source, "original-data", 13), "create Unicode source fixture");
         auto moved = storage.MoveInto({source}, nullptr, true);
@@ -210,6 +220,16 @@ int SelfTest(const std::wstring& directory) {
                    "Windows file rename synchronizes box title and persistent name");
             native.Ensure(nativeData, name, ExePath(), desktop);
             expect(native.Path() == renamed, "restart reuses native desktop entry instead of creating a duplicate");
+            {
+                const FILETIME marker{0x10203040, 0x01D90000};
+                KernelHandle handle(CreateFileW(renamed.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, 0, nullptr));
+                Check(handle.value != INVALID_HANDLE_VALUE && SetFileTime(handle.value, nullptr, nullptr, &marker) ? S_OK : E_FAIL);
+                native.Ensure(nativeData, name, ExePath(), desktop, false, true);
+                WIN32_FILE_ATTRIBUTE_DATA attributes{}; Check(GetFileAttributesExW(renamed.c_str(), GetFileExInfoStandard, &attributes) ? S_OK : E_FAIL);
+                expect(CompareFileTime(&marker, &attributes.ftLastWriteTime) == 0,
+                       "startup leaves a correctly configured native shortcut untouched instead of rewriting it and refreshing Explorer");
+            }
             auto alternateRoot = nativeData.root;
             std::transform(alternateRoot.begin(), alternateRoot.end(), alternateRoot.begin(), [](wchar_t c) {
                 return c >= L'a' && c <= L'z' ? static_cast<wchar_t>(c - L'a' + L'A') : c;

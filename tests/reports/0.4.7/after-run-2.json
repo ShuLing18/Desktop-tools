@@ -1,0 +1,22 @@
+{
+  "scenario": "5 boxes, 80 files each, 150% or current Windows DPI",
+  "samples": [
+    {"stage":"initialized","private_bytes":5279744,"working_set":26890240,"peak_private_bytes":5353472,"threads":7,"handles":271,"gdi_objects":131},
+    {"stage":"panel_open","private_bytes":10698752,"working_set":39481344,"peak_private_bytes":10772480,"threads":9,"handles":328,"gdi_objects":176},
+    {"stage":"panel_open","private_bytes":10711040,"working_set":40812544,"peak_private_bytes":11755520,"threads":9,"handles":328,"gdi_objects":212},
+    {"stage":"panel_open","private_bytes":10792960,"working_set":40910848,"peak_private_bytes":11767808,"threads":9,"handles":328,"gdi_objects":248},
+    {"stage":"panel_open","private_bytes":10899456,"working_set":41029632,"peak_private_bytes":11849728,"threads":9,"handles":328,"gdi_objects":282},
+    {"stage":"panel_open","private_bytes":10866688,"working_set":41951232,"peak_private_bytes":11956224,"threads":9,"handles":328,"gdi_objects":316},
+    {"stage":"all_panels_closed","private_bytes":9302016,"working_set":40423424,"peak_private_bytes":11956224,"threads":8,"handles":325,"gdi_objects":314},
+    {"stage":"idle_after_cache_expiry","private_bytes":6041600,"working_set":37163008,"peak_private_bytes":11956224,"threads":8,"handles":325,"gdi_objects":308}
+  ],
+  "render_60_frames_ms": 253.503100,
+  "first_frame_ms": [49.000500, 48.915900, 48.582800, 63.214500, 54.918500],
+  "reopen_first_frame_ms": [41.226200, 35.386200, 43.062900, 34.142000, 33.743000, 34.792500, 31.014500, 29.896900, 29.349300, 27.471700, 27.601400, 24.806500, 28.295000, 26.509800, 29.529200],
+  "settled_reopen_first_frame_ms": [23.359200, 25.020100, 28.590300, 22.802000, 28.559500, 17.308800, 22.490000, 24.412800, 20.046900, 21.055400, 25.212800, 19.520500, 17.889700, 19.590400, 17.891000],
+  "same_box_rapid_reopen_ms": [14.181200, 14.051800, 12.734400, 14.941800, 19.772200, 16.473200, 18.396600, 13.980900, 22.952400, 38.769500, 46.519100, 38.258400, 36.627800, 24.614800, 16.793900],
+  "glass_and_icons_ready_ms": [516.492800, 100.436800, 94.260400, 120.554800, 128.163500],
+  "capture_probe_ms": [9.351400, 9.602200, 10.228500, 10.286200, 10.440300],
+  "composition_flush_probe_ms": [3.873900, 1.268100, 3.796200, 4.841900, 3.416100],
+  "blur_probe_ms": [13.584500, 14.706900, 14.367800, 15.036200, 15.427000]
+}

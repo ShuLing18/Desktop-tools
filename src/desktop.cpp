@@ -36,13 +36,15 @@ HWND DesktopSurface() {
     return search.surface;
 }
 
-DesktopGrid ReadDesktopGrid(UINT dpi) {
+DesktopGrid ReadDesktopGrid(UINT dpi, bool includeOccupied) {
     DesktopGrid result;
     ICONMETRICSW metrics{}; metrics.cbSize = sizeof(metrics);
     if (SystemParametersInfoForDpi(SPI_GETICONMETRICS, sizeof(metrics), &metrics, 0, dpi))
         result.cell = {metrics.iHorzSpacing, metrics.iVertSpacing};
     else result.cell = {MulDiv(76, dpi, 96), MulDiv(100, dpi, 96)};
     result.iconSize = MulDiv(48, dpi, 96);
+    // Explorer owns native grid placement; hidden owner windows need only metrics.
+    if (!includeOccupied) return result;
     Interface<IShellWindows> windows;
     if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_LOCAL_SERVER, IID_IShellWindows, reinterpret_cast<void**>(windows.put())))) return result;
     VARIANT empty{}; VariantInit(&empty);

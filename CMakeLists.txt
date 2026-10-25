@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(DesktopBox VERSION 0.4.6 LANGUAGES CXX RC)
+project(DesktopBox VERSION 0.4.7 LANGUAGES CXX RC)
 option(DESKTOPBOX_BUILD_TESTS "Build the separate native regression-test executable" OFF)
 set(DESKTOPBOX_SOURCES src/main.cpp src/model.cpp src/selection.cpp src/storage.cpp src/desktop.cpp src/desktop_mouse.cpp src/native_entry.cpp src/backdrop.cpp src/shell_menu.cpp src/shell_registration.cpp src/fluent_settings.cpp resources/app.rc)
 add_executable(DesktopBox WIN32 ${DESKTOPBOX_SOURCES})

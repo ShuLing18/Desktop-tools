@@ -28,6 +28,19 @@ bool Owned(const std::wstring& path, const box::Storage& storage) {
     // Win32 paths are case-insensitive; launchers may normalize the executable/root spelling.
     return SUCCEEDED(link->GetArguments(arguments, 32768)) && _wcsicmp(Arguments(storage).c_str(), arguments) == 0;
 }
+bool Configured(const std::wstring& path, const box::Storage& storage, const std::wstring& executable) {
+    Ptr<IShellLinkW> link; Ptr<IPersistFile> file;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, reinterpret_cast<void**>(link.put()))) ||
+        FAILED(link->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(file.put()))) || FAILED(file->Load(path.c_str(), STGM_READ))) return false;
+    wchar_t value[32768]{}; int iconIndex = 0;
+    if (FAILED(link->GetPath(value, 32768, nullptr, SLGP_RAWPATH)) || _wcsicmp(value, executable.c_str()) != 0 ||
+        FAILED(link->GetWorkingDirectory(value, 32768)) || _wcsicmp(value, box::ParentPath(executable).c_str()) != 0 ||
+        FAILED(link->GetIconLocation(value, 32768, &iconIndex))) return false;
+    const auto icon = storage.SelectedIconPath();
+    if (!icon.empty()) return iconIndex == 0 && _wcsicmp(value, icon.c_str()) == 0;
+    SHSTOCKICONINFO stock{}; stock.cbSize = sizeof(stock);
+    return SUCCEEDED(SHGetStockIconInfo(SIID_FOLDER, SHGSI_ICONLOCATION, &stock)) && iconIndex == stock.iIcon && _wcsicmp(value, stock.szPath) == 0;
+}
 HRESULT DesktopView(IFolderView2** result) {
     Ptr<IShellWindows> windows; Ptr<IDispatch> dispatch; Ptr<IServiceProvider> services; Ptr<IShellBrowser> browser; Ptr<IShellView> view;
     HRESULT hr = CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_LOCAL_SERVER, IID_IShellWindows, reinterpret_cast<void**>(windows.put()));
@@ -49,7 +62,7 @@ void NativeEntry::Invalidate() {
     CoTaskMemFree(item_); item_ = nullptr;
 }
 void NativeEntry::Ensure(const Storage& storage, const std::wstring& name, const std::wstring& executable,
-                         const std::wstring& desktopOverride, bool renameExisting) {
+                         const std::wstring& desktopOverride, bool renameExisting, bool onlyIfChanged) {
     std::wstring desktop = desktopOverride;
     if (desktop.empty()) {
         wchar_t* folder = nullptr; Check(SHGetKnownFolderPath(FOLDERID_Desktop, KF_FLAG_CREATE, nullptr, &folder));
@@ -69,6 +82,9 @@ void NativeEntry::Ensure(const Storage& storage, const std::wstring& name, const
         if (owned && !MoveFileExW(previous.c_str(), desired.c_str(), MOVEFILE_WRITE_THROUGH)) throw HRESULT_FROM_WIN32(GetLastError());
         if (owned) SHChangeNotify(SHCNE_RENAMEITEM, SHCNF_PATHW, previous.c_str(), desired.c_str());
     } else desired = previous;
+    if (onlyIfChanged && owned && _wcsicmp(previous.c_str(), desired.c_str()) == 0 && Configured(desired, storage, executable)) {
+        path_ = desired; return;
+    }
     Ptr<IShellLinkW> link; Ptr<IPersistFile> file;
     Check(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLinkW, reinterpret_cast<void**>(link.put())));
     Check(link->SetPath(executable.c_str())); Check(link->SetArguments(Arguments(storage).c_str()));

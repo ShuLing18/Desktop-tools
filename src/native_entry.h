@@ -15,7 +15,7 @@ public:
     ~NativeEntry();
     void Invalidate();
     void Ensure(const Storage& storage, const std::wstring& name, const std::wstring& executable,
-                const std::wstring& desktopOverride = L"", bool renameExisting = false);
+                const std::wstring& desktopOverride = L"", bool renameExisting = false, bool onlyIfChanged = false);
     void Remove(const Storage& storage);
     bool Bounds(RECT& cell, RECT& image);
     bool RefreshName(const Storage& storage, std::wstring& name);

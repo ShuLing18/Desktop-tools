@@ -1,0 +1,15 @@
+{
+  "scenario": "5 boxes, 80 files each, 150% or current Windows DPI",
+  "samples": [
+    {"stage":"initialized","private_bytes":5152768,"working_set":26718208,"peak_private_bytes":5259264,"threads":7,"handles":271,"gdi_objects":124},
+    {"stage":"panel_open","private_bytes":9281536,"working_set":37871616,"peak_private_bytes":10891264,"threads":8,"handles":325,"gdi_objects":167},
+    {"stage":"panel_open","private_bytes":9281536,"working_set":39174144,"peak_private_bytes":10903552,"threads":8,"handles":325,"gdi_objects":203},
+    {"stage":"panel_open","private_bytes":9285632,"working_set":39186432,"peak_private_bytes":10907648,"threads":8,"handles":325,"gdi_objects":239},
+    {"stage":"panel_open","private_bytes":9285632,"working_set":39198720,"peak_private_bytes":10907648,"threads":8,"handles":325,"gdi_objects":275},
+    {"stage":"panel_open","private_bytes":9285632,"working_set":40148992,"peak_private_bytes":10907648,"threads":8,"handles":325,"gdi_objects":311},
+    {"stage":"all_panels_closed","private_bytes":6144000,"working_set":37011456,"peak_private_bytes":10907648,"threads":8,"handles":325,"gdi_objects":311}
+  ],
+  "render_60_frames_ms": 882.083600,
+  "first_frame_ms": [79.688400, 78.924200, 77.720700, 106.056300, 93.285900],
+  "reopen_first_frame_ms": [91.612200, 64.740300, 68.608000, 83.848200, 73.278400, 91.795300, 84.971900, 63.802500, 63.737300, 80.591400, 71.551600, 58.617000, 59.747200, 73.656000, 76.997900]
+}
