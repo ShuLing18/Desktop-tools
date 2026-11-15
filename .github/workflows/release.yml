@@ -1,0 +1,50 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - CMakeLists.txt
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktopbox-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Prepare compiler
+        run: python tools/bootstrap_compiler.py
+      - name: Build application and installer
+        shell: pwsh
+        run: |
+          .\build.ps1 -OutputName DesktopBox-0.5.0.exe
+          .\package.ps1 -Test
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v0.5.0 `
+            release/DesktopBox-0.5.0-Setup.exe `
+            release/DesktopBox-0.5.0.exe `
+            release/SHA256SUMS.txt `
+            'release/使用说明.txt' `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
+            --title '桌面收纳盒 0.5.0' `
+            --notes-file .github/release-notes/0.5.0.md `
+            --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }

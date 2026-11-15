@@ -13,6 +13,8 @@ void MakeTestIcon(const std::wstring& path) {
     if (!WriteBytes(path, data.data(), static_cast<DWORD>(data.size()))) throw E_FAIL;
 }
 
+#include "native_namespace_integration.inc"
+
 int SelfTest(const std::wstring& directory) {
     std::string report; int total = 0;
     auto expect = [&](bool ok, const char* description) {
@@ -97,8 +99,12 @@ int SelfTest(const std::wstring& directory) {
         expect(box::SafeName(L"CON.txt") == L"_CON.txt" && box::SafeName(L"a:b?. ") == L"a_b_", "reserved names and invalid filename characters");
         const auto sandbox = directory + L"\\run-" + std::to_wstring(GetTickCount64()); EnsureDirectory(sandbox);
         Storage storage(sandbox + L"\\data");
+#include "shell_menu_checks.inc"
 #include "optimization_checks.inc"
 #include "responsiveness_checks.inc"
+#include "namespace_checks.inc"
+#include "startup_checks.inc"
+#include "data_location_checks.inc"
         const auto source = sandbox + L"\\测试文件.txt";
         expect(WriteBytes(source, "original-data", 13), "create Unicode source fixture");
         auto moved = storage.MoveInto({source}, nullptr, true);
@@ -210,9 +216,24 @@ int SelfTest(const std::wstring& directory) {
             Check(shortcut->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(file.put()))); Check(file->Load(native.Path().c_str(), STGM_READ));
             wchar_t target[32768]{}, args[32768]{}, iconPath[32768]{}; int iconIndex = 0;
             shortcut->GetPath(target, 32768, nullptr, SLGP_RAWPATH); shortcut->GetArguments(args, 32768); shortcut->GetIconLocation(iconPath, 32768, &iconIndex);
-            expect(_wcsicmp(target, ExePath().c_str()) == 0 && std::wstring(args).find(L"--open-box") != std::wstring::npos && std::wstring(args).find(L"--drop") != std::wstring::npos,
-                   "native desktop shortcut launches its own box and accepts dropped original file paths");
+            expect(_wcsicmp(target, nativeData.items.c_str()) == 0 && !*args,
+                   "native desktop Open and double click target the box files directory without executable arguments");
             expect(nativeData.SelectedIconPath() == iconPath, "native Windows icon uses the persisted ICO library file");
+#include "native_drop_checks.inc"
+            {
+                const auto originalPath = native.Path();
+                const auto sentinel = nativeData.items + L"\\migration-preserves-file.txt";
+                WriteBytes(sentinel, "keep", 4);
+                Check(shortcut->SetPath(ExePath().c_str()));
+                Check(shortcut->SetArguments((L"--data-dir \"" + box::ParentPath(nativeData.journalDirectory) + L"\" --open-box \"" + nativeData.root + L"\" --drop").c_str()));
+                Check(shortcut->SetWorkingDirectory(box::ParentPath(ExePath()).c_str())); Check(file->Save(originalPath.c_str(), TRUE));
+                native.Ensure(nativeData, L"原生入口", ExePath(), desktop, false, true);
+                Check(file->Load(native.Path().c_str(), STGM_READ)); Check(shortcut->GetPath(target, 32768, nullptr, SLGP_RAWPATH));
+                Check(shortcut->GetArguments(args, 32768));
+                expect(native.Path() == originalPath && _wcsicmp(target, nativeData.items.c_str()) == 0 && !*args && ReadSmallFile(sentinel) == "keep",
+                       "legacy executable shortcuts migrate in place to folder Open without duplicate icons or modifying box files");
+                Check(DeleteFileW(sentinel.c_str()) ? S_OK : HRESULT_FROM_WIN32(GetLastError()));
+            }
             const auto renamed = desktop + L"\\Windows 重命名.lnk";
             expect(MoveFileW(native.Path().c_str(), renamed.c_str()) != FALSE, "simulate an Explorer rename of native desktop entry");
             std::wstring name;
@@ -371,7 +392,7 @@ int SelfTest(const std::wstring& directory) {
                         if ((pixels[y * bounds.right + x] >> 24) > 200) ++count;
                 return count;
             };
-            expect(visibleIn(preview.AnchorIconRect()) > preview.Px(100), "transparent anchor retains visible Windows folder icon");
+            expect(visibleIn(preview.AnchorIconRect()) > preview.Px(100), "transparent anchor retains the visible built-in application icon");
             expect(visibleIn(preview.AnchorLabelRect()) > 20, "transparent anchor retains readable box name");
             const RECT icon = preview.AnchorIconRect();
             expect(visibleIn({icon.right - preview.Px(12), preview.Px(2), icon.right + preview.Px(10), preview.Px(21)}) > 100, "transparent anchor retains item-count badge");
@@ -462,8 +483,10 @@ int SelfTest(const std::wstring& directory) {
                 std::vector<RAWINPUTDEVICE> devices(deviceCount);
                 GetRegisteredRawInputDevices(devices.data(), &deviceCount, sizeof(RAWINPUTDEVICE));
                 expect(std::any_of(devices.begin(), devices.end(), [&](const auto& device) {
-                    return device.usUsagePage == 1 && device.usUsage == 2 && device.hwndTarget == preview.host && (device.dwFlags & RIDEV_INPUTSINK);
-                }), "Raw Input routes background mouse events to the application window without disabling ordinary mouse messages");
+                    return device.usUsagePage == 1 && device.usUsage == 2 && device.hwndTarget != preview.host &&
+                        GetWindowThreadProcessId(device.hwndTarget, nullptr) == listener.ThreadId() &&
+                        (device.dwFlags & RIDEV_INPUTSINK) && !(device.dwFlags & RIDEV_NOLEGACY);
+                }), "Raw Input routes background events to the listener thread without disabling ordinary mouse messages");
                 const unsigned installed = listener.HookInstallations();
                 expect(listener.RequestHookRepair(), "a stalled hook can request recovery on its own listener thread");
                 const ULONGLONG repairStart = GetTickCount64();
@@ -735,7 +758,7 @@ int SelfTest(const std::wstring& directory) {
             };
             const auto executable = directory + L"\\安装 软件\\DesktopBox.exe", data = directory + L"\\用户 数据";
             const auto iconFile = directory + L"\\shell-new.ico"; MakeTestIcon(iconFile);
-            const auto icon = box::ShellNewIcon(iconFile); bool changed = false;
+            const auto icon = box::ShellNewIcon(iconFile, executable); bool changed = false;
             Check(box::RegisterShellNew(registry.key, executable, data, icon, changed));
             expect(changed && read(L".desktopbox", nullptr) == L"DesktopBox.StorageBox.1" &&
                    read(L"DesktopBox.StorageBox.1", nullptr) == L"桌面收纳盒",
@@ -752,7 +775,7 @@ int SelfTest(const std::wstring& directory) {
             Check(box::RegisterShellNew(registry.key, executable, data, icon, changed));
             expect(!changed, "repeated automatic Shell registration does not rewrite values or trigger unnecessary Explorer refreshes");
             const auto replacement = directory + L"\\新版\\DesktopBox.exe";
-            Check(box::RegisterShellNew(registry.key, replacement, data, box::ShellNewIcon(L""), changed));
+            Check(box::RegisterShellNew(registry.key, replacement, data, box::ShellNewIcon(L"", replacement), changed));
             Check(box::UnregisterShellNew(registry.key, executable, changed));
             expect(!changed && read(L"DesktopBox.StorageBox.1", L"DesktopBoxExecutable") == replacement,
                    "uninstalling an old executable preserves a newer installation registration");
@@ -904,7 +927,7 @@ int SelfTest(const std::wstring& directory) {
                        "individual ICO settings only change the selected box and preserve other boxes and global defaults");
                 expect(manager.trayCustomIcon_ && sameTrayPixels(manager.trayIcon_.value,
                        settingsIcons + L"\\" + iconA, manager.controller_),
-                       "changing one box ICO leaves the taskbar icon on the global ICO");
+                       "changing one box ICO leaves the notification area icon on the global ICO");
                 std::vector<AppearanceSettings> beforeCancel;
                 for (const auto& box : manager.boxes_) beforeCancel.push_back(AppearanceSettings::Read(box->storage));
                 exerciseDialog(&first, true, {2, 19, 3, L""}, false, [&] { manager.GlobalAppearance(); });
@@ -916,7 +939,7 @@ int SelfTest(const std::wstring& directory) {
                 expect(std::all_of(manager.boxes_.begin(), manager.boxes_.end(), [&](const auto& box) { return sameAppearance(*box, reset); }),
                        "global Restore Default resets all box ICOs including a previously customized individual box");
                 expect(!manager.trayCustomIcon_ && manager.trayIcon_.value,
-                       "global Restore Default also restores the Windows folder taskbar icon");
+                       "global Restore Default also restores the built-in notification area icon");
                 AppearanceSettings rootOnly = reset; rootOnly.icon = iconB;
                 first.CommitAppearance(rootOnly);
                 manager.NewBox(L"默认图标继承", {1000, 300});

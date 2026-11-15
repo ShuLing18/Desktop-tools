@@ -6,6 +6,8 @@
 #include <functional>
 #include <memory>
 #include <utility>
+#include <map>
+#include <shlwapi.h>
 
 namespace {
 void Check(HRESULT hr) { if (FAILED(hr)) throw hr; }
@@ -28,6 +30,11 @@ bool Within(const std::wstring& child, const std::wstring& parent) {
 }
 bool Exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
 void Directory(const std::wstring& path) {
+    const DWORD existing = GetFileAttributesW(path.c_str());
+    if (existing != INVALID_FILE_ATTRIBUTES) {
+        if (!(existing & FILE_ATTRIBUTE_DIRECTORY)) throw HRESULT_FROM_WIN32(ERROR_DIRECTORY);
+        return;
+    }
     const int error = SHCreateDirectoryExW(nullptr, path.c_str(), nullptr);
     if (error && error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) throw HRESULT_FROM_WIN32(error);
     DWORD attributes = GetFileAttributesW(path.c_str());
@@ -87,9 +94,11 @@ std::wstring ItemPath(IShellItem* item) {
 }
 class MoveSink final : public IFileOperationProgressSink {
     LONG refs_ = 1;
+    std::wstring source_;
     std::function<HRESULT(HRESULT, IShellItem*)> done_;
 public:
-    explicit MoveSink(std::function<HRESULT(HRESULT, IShellItem*)> callback) : done_(std::move(callback)) {}
+    MoveSink(std::wstring source, std::function<HRESULT(HRESULT, IShellItem*)> callback)
+        : source_(std::move(source)), done_(std::move(callback)) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override {
         if (!result) return E_POINTER;
         *result = nullptr;
@@ -103,7 +112,11 @@ public:
     HRESULT STDMETHODCALLTYPE PreRenameItem(DWORD, IShellItem*, LPCWSTR) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE PostRenameItem(DWORD, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE PreMoveItem(DWORD, IShellItem*, IShellItem*, LPCWSTR) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE PostMoveItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT hr, IShellItem* created) override { return done_(hr, created); }
+    HRESULT STDMETHODCALLTYPE PostMoveItem(DWORD, IShellItem* item, IShellItem*, LPCWSTR, HRESULT hr, IShellItem* created) override {
+        // A cross-volume folder move also reports its children. Only the requested
+        // top-level item determines completion and its original-location record.
+        return Same(ItemPath(item), source_) ? done_(hr, created) : S_OK;
+    }
     HRESULT STDMETHODCALLTYPE PreCopyItem(DWORD, IShellItem*, IShellItem*, LPCWSTR) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE PostCopyItem(DWORD, IShellItem*, IShellItem*, LPCWSTR, HRESULT, IShellItem*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE PreDeleteItem(DWORD, IShellItem*) override { return S_OK; }
@@ -128,6 +141,14 @@ box::MoveResult Move(const std::vector<Plan>& plans, HWND owner, bool quiet) {
     DWORD flags = FOF_RENAMEONCOLLISION | FOF_NOCONFIRMMKDIR | FOFX_NOCOPYHOOKS;
     flags |= quiet ? FOF_NO_UI : (FOF_ALLOWUNDO | FOFX_ADDUNDORECORD);
     Check(operation->SetOperationFlags(flags));
+    struct Completion {
+        HRESULT status;
+        std::wstring source, actual;
+        std::vector<std::wstring> oldRecords;
+        Record pending;
+        bool track;
+    };
+    std::vector<Completion> completed;
     std::vector<std::unique_ptr<MoveSink, void(*)(MoveSink*)>> sinks;
     for (const auto& plan : plans) {
         Directory(plan.destination);
@@ -157,20 +178,11 @@ box::MoveResult Move(const std::vector<Plan>& plans, HWND owner, bool quiet) {
         Ptr<IShellItem> item, target;
         Check(SHCreateItemFromParsingName(source.c_str(), nullptr, IID_IShellItem, reinterpret_cast<void**>(item.out())));
         Check(SHCreateItemFromParsingName(destination.c_str(), nullptr, IID_IShellItem, reinterpret_cast<void**>(target.out())));
-        auto* sink = new MoveSink([&, source, oldRecords, pending, track = plan.track](HRESULT hr, IShellItem* created) -> HRESULT {
+        auto* sink = new MoveSink(source, [&, source, oldRecords, pending, track = plan.track](HRESULT hr, IShellItem* created) -> HRESULT {
             try {
-                auto actual = ItemPath(created);
-                if (SUCCEEDED(hr) && !actual.empty() && Exists(actual) && !Exists(source)) {
-                    if (track) { auto completed = pending; completed.current = actual; completed.source.clear(); Save(completed); }
-                    for (const auto& file : oldRecords) DeleteFileW(file.c_str());
-                    ++result.moved;
-                } else {
-                    result.complete = false;
-                    if (track && Exists(source) && !Exists(pending.current)) DeleteFileW(pending.file.c_str());
-                }
+                completed.push_back({hr, source, ItemPath(created), oldRecords, pending, track});
                 return S_OK;
-            } catch (HRESULT error) { result.complete = false; return error; }
-            catch (...) { result.complete = false; return E_FAIL; }
+            } catch (...) { return E_OUTOFMEMORY; }
         });
         sinks.emplace_back(sink, [](MoveSink* p) { p->Release(); });
         const auto requestedName = plan.track ? box::BaseName(pending.current) : plan.name;
@@ -178,6 +190,18 @@ box::MoveResult Move(const std::vector<Plan>& plans, HWND owner, bool quiet) {
     }
     HRESULT performed = operation->PerformOperations();
     BOOL aborted = FALSE; Check(operation->GetAnyOperationsAborted(&aborted));
+    // Cross-volume folders can be reported after the copy but before Windows
+    // removes the source directory. Verify and journal only after the batch ends.
+    for (const auto& move : completed) {
+        if (SUCCEEDED(move.status) && !move.actual.empty() && Exists(move.actual) && !Exists(move.source)) {
+            if (move.track) { auto record = move.pending; record.current = move.actual; record.source.clear(); Save(record); }
+            for (const auto& file : move.oldRecords) DeleteFileW(file.c_str());
+            ++result.moved;
+        } else {
+            result.complete = false;
+            if (move.track && Exists(move.source) && !Exists(move.pending.current)) DeleteFileW(move.pending.file.c_str());
+        }
+    }
     result.complete = result.complete && SUCCEEDED(performed) && !aborted;
     if (FAILED(performed) && performed != HRESULT_FROM_WIN32(ERROR_CANCELLED)) throw performed;
     return result;
@@ -194,6 +218,7 @@ Storage::Storage(std::wstring directory, std::wstring icons, std::wstring journa
 std::wstring Storage::Read(const wchar_t* key, const wchar_t* fallback) const { auto result = IniRead(ini, L"DesktopBox", key); return result.empty() ? fallback : result; }
 int Storage::ReadInt(const wchar_t* key, int fallback) const { return GetPrivateProfileIntW(L"DesktopBox", key, fallback, ini.c_str()); }
 void Storage::Write(const wchar_t* key, const std::wstring& value) const {
+    if (Read(key) == value) return;
     if (!WritePrivateProfileStringW(L"DesktopBox", key, value.c_str(), ini.c_str())) throw HRESULT_FROM_WIN32(GetLastError());
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, ini.c_str());
 }
@@ -219,12 +244,88 @@ std::wstring Storage::ImportIcon(const std::wstring& source) const {
 void Storage::SetCustomIcon(const std::wstring& source) const {
     Write(L"IconFile", ImportIcon(source));
 }
+bool Storage::EnsureMoveDropTarget() const {
+    // Explorer handles drops on the native folder object, including while the
+    // app is closed. Set the default on this folder so cross-volume drops move too.
+    const auto settings = items + L"\\desktop.ini";
+    DWORD attributes = GetFileAttributesW(settings.c_str());
+    bool changed = false;
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        const WORD bom = 0xFEFF;
+        if (!Bytes(settings, &bom, sizeof(bom), CREATE_NEW)) throw HRESULT_FROM_WIN32(GetLastError());
+        attributes = GetFileAttributesW(settings.c_str()); changed = true;
+    }
+    if (GetPrivateProfileIntW(L".ShellClassInfo", L"DefaultDropEffect", 0, settings.c_str()) != DROPEFFECT_MOVE) {
+        if ((attributes & FILE_ATTRIBUTE_READONLY) && !SetFileAttributesW(settings.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY))
+            throw HRESULT_FROM_WIN32(GetLastError());
+        const BOOL saved = WritePrivateProfileStringW(L".ShellClassInfo", L"DefaultDropEffect", L"2", settings.c_str());
+        const DWORD error = GetLastError();
+        if ((attributes & FILE_ATTRIBUTE_READONLY) && !SetFileAttributesW(settings.c_str(), attributes))
+            throw HRESULT_FROM_WIN32(GetLastError());
+        if (!saved) throw HRESULT_FROM_WIN32(error);
+        WritePrivateProfileStringW(nullptr, nullptr, nullptr, settings.c_str()); changed = true;
+    }
+    const DWORD metadata = attributes | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+    if (attributes != metadata) {
+        if (!SetFileAttributesW(settings.c_str(), metadata)) throw HRESULT_FROM_WIN32(GetLastError());
+        changed = true;
+    }
+    const DWORD folder = GetFileAttributesW(items.c_str());
+    if (!(folder & FILE_ATTRIBUTE_READONLY)) {
+        if (!SetFileAttributesW(items.c_str(), folder | FILE_ATTRIBUTE_READONLY)) throw HRESULT_FROM_WIN32(GetLastError());
+        changed = true;
+    }
+    if (changed) SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, items.c_str(), nullptr);
+    return changed;
+}
 std::vector<std::wstring> Storage::Entries() const {
-    std::vector<std::wstring> result; WIN32_FIND_DATAW entry{};
-    HANDLE search = FindFirstFileW((items + L"\\*").c_str(), &entry);
-    if (search == INVALID_HANDLE_VALUE) return result;
-    do { if (wcscmp(entry.cFileName, L".") && wcscmp(entry.cFileName, L"..")) result.push_back(items + L"\\" + entry.cFileName); } while (FindNextFileW(search, &entry));
-    FindClose(search); return result;
+    std::vector<std::wstring> result;
+    for (auto& entry : Snapshot(false)) result.push_back(std::move(entry.path));
+    return result;
+}
+std::vector<StorageEntry> Storage::Snapshot(bool includeOrder, const std::function<bool()>& cancelled) const {
+    struct Less { bool operator()(const std::wstring& a, const std::wstring& b) const { return _wcsicmp(a.c_str(), b.c_str()) < 0; } };
+    std::map<std::wstring, int, Less> order;
+    if (includeOrder) {
+        std::vector<wchar_t> buffer(1024);
+        DWORD count = 0;
+        for (;;) {
+            count = GetPrivateProfileSectionW(L"Order", buffer.data(), static_cast<DWORD>(buffer.size()), ini.c_str());
+            if (count < buffer.size() - 2 || buffer.size() >= 1024 * 1024) break;
+            buffer.resize(buffer.size() * 2);
+        }
+        for (size_t start = 0; start < count;) {
+            const std::wstring setting(buffer.data() + start); start += setting.size() + 1;
+            const auto split = setting.find(L'='); int value = INT_MAX;
+            if (split != std::wstring::npos && StrToIntExW(setting.c_str() + split + 1, STIF_SUPPORT_HEX, &value))
+                order.emplace(setting.substr(0, split), value);
+        }
+    }
+    std::vector<StorageEntry> result; WIN32_FIND_DATAW entry{};
+    HANDLE search = FindFirstFileExW((items + L"\\*").c_str(), FindExInfoBasic, &entry, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (search == INVALID_HANDLE_VALUE && (GetLastError() == ERROR_INVALID_PARAMETER || GetLastError() == ERROR_NOT_SUPPORTED))
+        search = FindFirstFileExW((items + L"\\*").c_str(), FindExInfoBasic, &entry, FindExSearchNameMatch, nullptr, 0);
+    if (search == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_NO_MORE_FILES) throw HRESULT_FROM_WIN32(error);
+        return result;
+    }
+    struct SearchScope { HANDLE handle; ~SearchScope() { FindClose(handle); } } scope{search};
+    do {
+        if (cancelled && cancelled()) throw HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        if (!wcscmp(entry.cFileName, L".") || !wcscmp(entry.cFileName, L"..")) continue;
+        // Folder settings belong to Explorer, not the user's collected items.
+        const DWORD metadata = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+        if (!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && _wcsicmp(entry.cFileName, L"desktop.ini") == 0 &&
+            (entry.dwFileAttributes & metadata) == metadata) continue;
+        const auto found = order.find(entry.cFileName);
+        result.push_back({items + L"\\" + entry.cFileName,
+            (static_cast<ULONGLONG>(entry.ftLastWriteTime.dwHighDateTime) << 32) | entry.ftLastWriteTime.dwLowDateTime,
+            found == order.end() ? INT_MAX : found->second});
+    } while (FindNextFileW(search, &entry));
+    const DWORD error = GetLastError();
+    if (error != ERROR_NO_MORE_FILES) throw HRESULT_FROM_WIN32(error);
+    return result;
 }
 std::wstring Storage::OriginalPath(const std::wstring& current) const {
     const auto identity = Identity(current);
@@ -234,12 +335,17 @@ std::wstring Storage::OriginalPath(const std::wstring& current) const {
 }
 void Storage::ReconcileOrigins() const {
     std::vector<std::pair<std::wstring, std::wstring>> identities;
-    bool complete = true;
-    for (const auto& path : Entries()) { auto id = Identity(path); if (id.empty()) complete = false; else identities.emplace_back(std::move(id), path); }
+    bool complete = true, indexed = false;
     for (auto record : Records(journalDirectory)) if (Same(ParentPath(record.current), items) && record.source.empty()) {
         const auto currentId = Identity(record.current);
         if (record.identity.empty() && !currentId.empty()) { Save(record); continue; }
         if (record.identity.empty() || currentId == record.identity) continue;
+        // Most refreshes have no renamed tracked file. Open file IDs only if a
+        // stale record actually needs a rename lookup, once for this operation.
+        if (!indexed) {
+            indexed = true;
+            for (const auto& path : Entries()) { auto id = Identity(path); if (id.empty()) complete = false; else identities.emplace_back(std::move(id), path); }
+        }
         const auto renamed = std::find_if(identities.begin(), identities.end(), [&](const auto& entry) { return entry.first == record.identity; });
         if (renamed != identities.end()) { record.current = renamed->second; Save(record); }
         else if (complete && !Exists(record.current)) DeleteFileW(record.file.c_str());

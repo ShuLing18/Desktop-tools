@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <commctrl.h>
+1 ICON "ico/DesktopBox-WhaleGirl.ico"
 LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
 101 DIALOGEX 0, 0, 240, 86
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
@@ -31,7 +32,7 @@ BEGIN
   RTEXT "模糊", 1123, 216, 217, 75, 12
   CONTROL "", 1132, "Static", SS_NOTIFY, 26, 257, 27, 26
   LTEXT "收纳盒图标", 1130, 64, 251, 100, 14
-  LTEXT "Windows 文件夹", 1131, 64, 268, 100, 13, SS_ENDELLIPSIS
+  LTEXT "默认 · 大肥鱼", 1131, 64, 268, 100, 13, SS_ENDELLIPSIS
   PUSHBUTTON "选择 ICO…", 1140, 176, 251, 59, 23
   PUSHBUTTON "恢复默认", 1141, 242, 251, 51, 23
   PUSHBUTTON "打开 ICO 图标库", 1142, 201, 278, 92, 17
@@ -40,8 +41,8 @@ BEGIN
 END
 1 RT_MANIFEST "resources/app.manifest"
 1 VERSIONINFO
-FILEVERSION 0,4,7,0
-PRODUCTVERSION 0,4,7,0
+FILEVERSION 0,5,0,0
+PRODUCTVERSION 0,5,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -51,7 +52,7 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "桌面收纳盒\0"
       VALUE "ProductName", "DesktopBox\0"
-      VALUE "FileVersion", "0.4.7\0"
+      VALUE "FileVersion", "0.5.0\0"
     END
   END
   BLOCK "VarFileInfo"

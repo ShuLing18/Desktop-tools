@@ -21,7 +21,8 @@ try {
     & $Zig rc /c65001 /fo build/app.res resources/app.rc
     if ($LASTEXITCODE -ne 0) { throw 'Resource compilation failed.' }
     function Build-DesktopBox([string]$Destination, [string[]]$ExtraFlags = @()) {
-    & $Zig c++ src/main.cpp src/model.cpp src/selection.cpp src/storage.cpp src/desktop.cpp src/desktop_mouse.cpp src/native_entry.cpp src/backdrop.cpp src/shell_menu.cpp src/shell_registration.cpp src/fluent_settings.cpp build/app.res -o $Destination @ExtraFlags `
+    & $Zig c++ src/main.cpp src/model.cpp src/selection.cpp src/storage.cpp src/desktop.cpp src/desktop_mouse.cpp src/native_entry.cpp src/desktop_namespace.cpp src/backdrop.cpp src/shell_menu.cpp src/shell_registration.cpp src/fluent_settings.cpp build/app.res -o $Destination @ExtraFlags `
+        -target x86_64-windows-gnu -mcpu=baseline `
         -std=c++17 -Os -s -municode '-Wl,--subsystem,windows' -DUNICODE -D_UNICODE -DNOMINMAX `
         -D_WIN32_WINNT=0x0a00 -Wall -Wextra -Wno-unknown-pragmas -Wno-unused-command-line-argument `
         -luser32 -lgdi32 -lshell32 -lshlwapi -lole32 -loleaut32 -luuid `
@@ -34,7 +35,8 @@ try {
         $taskTestPath = Join-Path $taskBuild 'self-test'
         $taskExe = Join-Path $taskBuild 'DesktopBox-tests.exe'
         Build-DesktopBox $taskExe @('-DDESKTOPBOX_TESTS')
-        $taskProcess = Start-Process -FilePath $taskExe -ArgumentList @('--self-test', ('"' + $taskTestPath + '"')) -WindowStyle Hidden -PassThru -Wait
+        $taskProcess = Start-Process -FilePath $taskExe -ArgumentList @('--self-test', ('"' + $taskTestPath + '"')) -WindowStyle Hidden -PassThru
+        $taskProcess.WaitForExit()
         Get-Content -LiteralPath (Join-Path $taskTestPath 'results.txt')
         if ($taskProcess.ExitCode -ne 0) { throw 'Self-test failed.' }
     }

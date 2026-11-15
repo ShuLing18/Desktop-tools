@@ -44,13 +44,10 @@ std::wstring ShellNewCommand(const std::wstring& executable, const std::wstring&
     // Command creates the native desktop link itself. No placeholder file is needed.
     return L"\"" + executable + L"\" --data-dir \"" + dataRoot + L"\" --new-box";
 }
-std::wstring ShellNewIcon(const std::wstring& customIcon) {
+std::wstring ShellNewIcon(const std::wstring& customIcon, const std::wstring& executable) {
     if (!customIcon.empty() && GetFileAttributesW(customIcon.c_str()) != INVALID_FILE_ATTRIBUTES)
         return L"\"" + customIcon + L"\",0";
-    SHSTOCKICONINFO stock{}; stock.cbSize = sizeof(stock);
-    const HRESULT result = SHGetStockIconInfo(SIID_FOLDER, SHGSI_ICONLOCATION, &stock);
-    if (FAILED(result)) throw result;
-    return L"\"" + std::wstring(stock.szPath) + L"\"," + std::to_wstring(stock.iIcon);
+    return L"\"" + executable + L"\",0";
 }
 HRESULT RegisterShellNew(HKEY classesRoot, const std::wstring& executable,
                          const std::wstring& dataRoot, const std::wstring& icon, bool& changed) {

@@ -27,10 +27,19 @@ int PerformanceTest(const std::wstring& directory) {
     int result = 0;
     try {
         const auto data = directory + L"\\data", icons = directory + L"\\ico";
-        Storage first(data, icons, data + L"\\origins");
-        first.Write(L"Deleted", L"0"); first.Write(L"BackgroundMode", L"0"); first.Write(L"GlassTransparency", L"55"); first.Write(L"GlassBlur", L"18");
-        for (int i = 0; i < 80; ++i) WriteBytes(first.items + L"\\sample-" + std::to_wstring(i) + L".txt", "benchmark", 9);
+        // Prepare the full reference load before starting the initialization clock.
+        for (int boxIndex = 0; boxIndex < 5; ++boxIndex) {
+            const auto folder = boxIndex == 0 ? data : data + L"\\boxes\\benchmark-" + std::to_wstring(boxIndex);
+            Storage fixture(folder, icons, data + L"\\origins");
+            fixture.Write(L"Deleted", L"0"); fixture.Write(L"BackgroundMode", L"0"); fixture.Write(L"GlassTransparency", L"55"); fixture.Write(L"GlassBlur", L"18");
+            for (int i = 0; i < 80; ++i) WriteBytes(fixture.items + L"\\sample-" + std::to_wstring(i) + L".txt", "benchmark", 9);
+        }
+        LARGE_INTEGER initFrequency{}, initStart{}, initEnd{}; QueryPerformanceFrequency(&initFrequency);
+        IO_COUNTERS initIoBefore{}, initIoAfter{}; GetProcessIoCounters(GetCurrentProcess(), &initIoBefore);
+        QueryPerformanceCounter(&initStart);
         Manager manager(GetModuleHandleW(nullptr), data, icons); manager.Initialize(false);
+        QueryPerformanceCounter(&initEnd); GetProcessIoCounters(GetCurrentProcess(), &initIoAfter);
+        const double initializationMs = 1000. * (initEnd.QuadPart - initStart.QuadPart) / initFrequency.QuadPart;
         while (manager.boxes_.size() < 5) manager.NewBox(L"Benchmark " + std::to_wstring(manager.boxes_.size()), {600, 300});
         for (const auto& box : manager.boxes_) {
             for (int i = 0; i < 80; ++i) WriteBytes(box->storage.items + L"\\sample-" + std::to_wstring(i) + L".txt", "benchmark", 9);
@@ -89,6 +98,22 @@ int PerformanceTest(const std::wstring& directory) {
         while (cachePending() && GetTickCount64() < cacheDeadline) { pump(); Sleep(1); }
         if (cachePending()) throw HRESULT_FROM_WIN32(ERROR_TIMEOUT);
         pump(); sample("idle_after_cache_expiry");
+        FILETIME created{}, exited{}, kernelBefore{}, userBefore{}, kernelAfter{}, userAfter{};
+        IO_COUNTERS idleIoBefore{}, idleIoAfter{};
+        GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernelBefore, &userBefore);
+        GetProcessIoCounters(GetCurrentProcess(), &idleIoBefore);
+        const auto idleStarted = GetTickCount64(), idleDeadline = idleStarted + 10000;
+        while (GetTickCount64() < idleDeadline) {
+            const auto now = GetTickCount64(); if (now >= idleDeadline) break;
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, static_cast<DWORD>(idleDeadline - now), QS_ALLINPUT);
+            pump();
+        }
+        const auto idleWallMs = GetTickCount64() - idleStarted;
+        GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernelAfter, &userAfter);
+        GetProcessIoCounters(GetCurrentProcess(), &idleIoAfter);
+        auto ticks = [](FILETIME time) { return (static_cast<ULONGLONG>(time.dwHighDateTime) << 32) | time.dwLowDateTime; };
+        const double idleCpuMs = (ticks(kernelAfter) + ticks(userAfter) - ticks(kernelBefore) - ticks(userBefore)) / 10000.;
+        sample("after_idle_observation");
         RECT captureRect{}; GetWindowRect(manager.boxes_.front()->panel, &captureRect);
         for (int probe = 0; probe < 5; ++probe) {
             box::Backdrop capture;
@@ -100,6 +125,14 @@ int PerformanceTest(const std::wstring& directory) {
             blurMs.push_back(1000. * (finished.QuadPart - started.QuadPart) / frequency.QuadPart);
         }
         report += "\n  ],\n  \"render_60_frames_ms\": " + std::to_string(1000. * renderTicks / frequency.QuadPart);
+        report += ",\n  \"initialization_ms\": " + std::to_string(initializationMs) +
+                  ",\n  \"initialization_read_operations\": " + std::to_string(initIoAfter.ReadOperationCount - initIoBefore.ReadOperationCount) +
+                  ",\n  \"initialization_write_operations\": " + std::to_string(initIoAfter.WriteOperationCount - initIoBefore.WriteOperationCount) +
+                  ",\n  \"idle_wall_ms\": " + std::to_string(idleWallMs) +
+                  ",\n  \"idle_cpu_ms\": " + std::to_string(idleCpuMs) +
+                  ",\n  \"idle_single_core_percent\": " + std::to_string(idleCpuMs * 100. / idleWallMs) +
+                  ",\n  \"idle_read_operations\": " + std::to_string(idleIoAfter.ReadOperationCount - idleIoBefore.ReadOperationCount) +
+                  ",\n  \"idle_write_operations\": " + std::to_string(idleIoAfter.WriteOperationCount - idleIoBefore.WriteOperationCount);
         auto addTimes = [&](const char* name, const std::vector<double>& times) {
             report += ",\n  \"" + std::string(name) + "\": [";
             for (size_t i = 0; i < times.size(); ++i) { if (i) report += ", "; report += std::to_string(times[i]); }

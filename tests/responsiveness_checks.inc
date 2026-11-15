@@ -1,5 +1,160 @@
 // Exercise output and lifecycle guarantees instead of asserting machine-specific timings.
 {
+    static HANDLE entered = nullptr, release = nullptr;
+    static std::atomic<unsigned> queries{0};
+    static std::atomic<DWORD> queryThread{0};
+    KernelHandle enteredEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    KernelHandle releaseEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    entered = enteredEvent.value; release = releaseEvent.value; queries = 0; queryThread = 0;
+    const auto query = +[](const std::vector<std::wstring>& paths, HWND) {
+        ++queries; queryThread = GetCurrentThreadId();
+        if (!paths.empty() && paths.front() == L"slow") { SetEvent(entered); WaitForSingleObject(release, 5000); }
+        std::vector<box::NativeBounds> result;
+        for (const auto& path : paths) result.push_back({path, {10,20,110,140}, {24,22,96,94}, true});
+        return result;
+    };
+    Manager startup(GetModuleHandleW(nullptr), sandbox + L"\\nonblocking-desktop", storage.iconDirectory);
+    startup.Initialize(false);
+    const UINT resultMessage = WM_APP + 92;
+    box::DesktopBoundsLoader loader(query);
+    struct ReleaseAtExit { HANDLE event; ~ReleaseAtExit() { SetEvent(event); } } guard{release};
+    expect(loader.RequestBounds(startup.controller_, resultMessage, startup.controller_, {L"slow"}, 1) &&
+           WaitForSingleObject(entered, 2000) == WAIT_OBJECT_0 && queryThread != GetCurrentThreadId(),
+           "cold desktop queries run in a separate COM apartment while the UI remains free");
+    auto& app = *startup.boxes_.front(); app.nativeMode_ = true; app.nativeLocated_ = false;
+    app.UpdateNativeBounds();
+    expect(app.ShowPanel() && app.PanelVisible() && loader.Busy(),
+           "explicit opening and the message loop remain usable while Explorer initialization is delayed");
+    app.HidePanel(); app.nativeMode_ = false;
+    expect(loader.RequestBounds(startup.controller_, resultMessage, startup.controller_, {L"obsolete"}, 2) &&
+           loader.RequestBounds(startup.controller_, resultMessage, startup.controller_, {L"latest"}, 3),
+           "desktop refresh bursts retain only the latest pending snapshot");
+    SetEvent(release);
+    const auto deadline = GetTickCount64() + 5000;
+    bool latest = false;
+    while (!latest && GetTickCount64() < deadline) {
+        MSG message{};
+        while (PeekMessageW(&message, startup.controller_, resultMessage, resultMessage, PM_REMOVE)) {
+            std::unique_ptr<box::DesktopBoundsResult> result(reinterpret_cast<box::DesktopBoundsResult*>(message.lParam));
+            latest = result && result->generation == 3 && result->entries.size() == 1 && result->entries.front().path == L"latest";
+        }
+        if (!latest) Sleep(1);
+    }
+    expect(latest && queries == 2, "one active desktop query is followed by one newest snapshot without an unbounded queue");
+    loader.Stop();
+    expect(!loader.Busy(), "stopping the desktop worker drains results and releases its request state");
+    app.nativeMode_ = true; app.nativeLocated_ = false;
+    startup.desktopSurface_ = startup.controller_; startup.boundsGeneration_ = 7;
+    startup.lastSurfaceRefresh_ = startup.lastNativeRefresh_ = GetTickCount64();
+    box::DesktopBoundsResult current; current.generation = 6; current.desktop = startup.controller_;
+    current.entries.push_back({app.NativePath(), {10,20,110,140}, {24,22,96,94}, true});
+    startup.ReceiveNativeBounds(current);
+    expect(!app.NativeReady(), "a superseded desktop result cannot move or reactivate a native icon");
+    current.generation = 7; startup.ReceiveNativeBounds(current);
+    expect(app.NativeReady() && startup.DesktopReady() && startup.desktopReadyAt_ != 0,
+           "a current desktop snapshot activates the matching icon and records first readiness");
+    const auto firstReady = startup.desktopReadyAt_; startup.BeginDesktopRetry();
+    expect(startup.desktopReadyAt_ == firstReady,
+           "a later Explorer taskbar restart cannot overwrite the original startup-ready measurement");
+    current.desktop = nullptr; current.entries.front().image = {300,300,372,372};
+    startup.ReceiveNativeBounds(current);
+    expect(app.nativeImage_.left == 24, "results from a replaced desktop surface do not overwrite current hit-test bounds");
+    app.nativeMode_ = false;
+}
+{
+    Manager retry(GetModuleHandleW(nullptr), sandbox + L"\\hover-retry", storage.iconDirectory);
+    retry.Initialize(false); retry.NewBox(L"临时阻塞", {800, 500});
+    auto& target = *retry.boxes_.front(); auto& blocker = *retry.boxes_.back();
+    target.nativeMode_ = true; target.nativeLocated_ = true; target.nativeImage_ = {100, 100, 148, 148};
+    blocker.inMenu_ = true;
+    const POINT hovered{120, 120};
+    target.NativeMouse(hovered, true, false);
+    MSG retryMessage{};
+    const bool queued = PeekMessageW(&retryMessage, retry.controller_, kHoverOpenRetry, kHoverOpenRetry, PM_REMOVE) != FALSE;
+    expect(queued && !target.PanelVisible() && target.hoverOpenRetryPending_,
+           "a temporarily blocked hover queues one coalesced retry for the same native icon");
+    retry.Handle(kHoverOpenRetry, retryMessage.wParam, retryMessage.lParam);
+    expect(!target.hoverOpenRetryPending_ && retry.pointerSettlePending_,
+           "a refused hover schedules another pointer check instead of relying on new mouse movement");
+    blocker.inMenu_ = false; target.NativeMouse(hovered, true, false);
+    expect(target.PanelVisible(), "a stationary hover opens as soon as the other box can yield its panel");
+    target.HidePanel();
+}
+{
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    const auto pixels = [](HICON icon, int size) {
+        box::DibSurface surface;
+        if (!icon || !surface.Ensure(nullptr, size, size)) return std::vector<DWORD>{};
+        std::fill_n(surface.Pixels(), static_cast<size_t>(size) * size, 0);
+        if (!DrawIconEx(surface.DC(), 0, 0, icon, size, size, 0, nullptr, DI_NORMAL)) return std::vector<DWORD>{};
+        GdiFlush();
+        return std::vector<DWORD>(surface.Pixels(), surface.Pixels() + static_cast<size_t>(size) * size);
+    };
+    const auto matchesDefault = [&](HICON icon, int size) {
+        Icon expected(reinterpret_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(1), IMAGE_ICON, size, size, 0)));
+        const auto actual = pixels(icon, size);
+        return std::any_of(actual.begin(), actual.end(), [](DWORD pixel) { return pixel != 0; }) &&
+            actual == pixels(expected.value, size);
+    };
+    const auto root = sandbox + L"\\built-in-icon-data", icons = sandbox + L"\\built-in-icon-library";
+    {
+        Manager manager(instance, root, icons); manager.Initialize(false);
+        auto& first = *manager.boxes_.front();
+        expect(first.storage.SelectedIconPath().empty() &&
+               matchesDefault(first.folderIcon_.value, std::max(first.Px(48), first.desktopIconSize_)),
+               "a fresh box uses the embedded whale-girl icon without an external ICO file");
+        const int traySize = GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForWindow(manager.controller_));
+        expect(!manager.trayCustomIcon_ && matchesDefault(manager.trayIcon_.value, traySize),
+               "the default notification area icon matches the embedded application icon at the current DPI");
+        manager.NewBox(L"内置默认", {900, 600});
+        expect(manager.boxes_.back()->storage.Read(L"IconFile").empty() &&
+               matchesDefault(manager.boxes_.back()->folderIcon_.value,
+                   std::max(manager.boxes_.back()->Px(48), manager.boxes_.back()->desktopIconSize_)),
+               "new boxes inherit the built-in default icon without writing a machine-specific image path");
+        first.storage.Write(L"IconFile", L"missing-user-icon.ico"); first.LoadAppearance();
+        expect(matchesDefault(first.folderIcon_.value, std::max(first.Px(48), first.desktopIconSize_)),
+               "a removed custom ICO falls back to the embedded icon without erasing the saved choice");
+        manager.ApplyGlobalAppearance({0, 55, 18, L""});
+        expect(matchesDefault(first.folderIcon_.value, std::max(first.Px(48), first.desktopIconSize_)) &&
+               matchesDefault(manager.trayIcon_.value, traySize),
+               "Restore Default consistently restores the embedded icon for boxes and notification area");
+    }
+    {
+        Manager reopened(instance, root, icons); reopened.Initialize(false);
+        expect(reopened.boxes_.size() == 2 &&
+               std::all_of(reopened.boxes_.begin(), reopened.boxes_.end(), [&](const auto& app) {
+                   return app->storage.Read(L"IconFile").empty() &&
+                       matchesDefault(app->folderIcon_.value, std::max(app->Px(48), app->desktopIconSize_));
+               }), "the built-in default icon survives reopening all boxes");
+    }
+    const auto desktop = sandbox + L"\\built-in-icon-desktop"; EnsureDirectory(desktop);
+    Storage data(sandbox + L"\\built-in-icon-link");
+    box::NativeEntry entry; entry.Ensure(data, L"内置图标", ExePath(), desktop);
+    const auto pointsToExecutableIcon = [&] {
+        ComPtr<IShellLinkW> shortcut; ComPtr<IPersistFile> persisted;
+        Check(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+            IID_IShellLinkW, reinterpret_cast<void**>(shortcut.put())));
+        Check(shortcut->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(persisted.put())));
+        Check(persisted->Load(data.Read(L"DesktopLink").c_str(), STGM_READ));
+        wchar_t location[32768]{}; int index = -1;
+        Check(shortcut->GetIconLocation(location, 32768, &index));
+        return index == 0 && _wcsicmp(location, ExePath().c_str()) == 0;
+    };
+    expect(pointsToExecutableIcon(), "native desktop links use the executable embedded icon by default");
+    data.Write(L"IconFile", L"missing-user-icon.ico");
+    entry.Ensure(data, L"内置图标", ExePath(), desktop, false, true);
+    expect(pointsToExecutableIcon(), "native desktop links fall back to the executable when a custom ICO is missing");
+    const auto defaultLocation = L"\"" + ExePath() + L"\",0";
+    expect(box::ShellNewIcon(L"", ExePath()) == defaultLocation &&
+           box::ShellNewIcon(icons + L"\\missing-user-icon.ico", ExePath()) == defaultLocation,
+           "desktop New menu defaults and missing-icon fallback use the same embedded icon");
+    HRSRC group = FindResourceW(instance, MAKEINTRESOURCEW(1), RT_GROUP_ICON);
+    const auto* bytes = group ? static_cast<const BYTE*>(LockResource(LoadResource(instance, group))) : nullptr;
+    const DWORD length = group ? SizeofResource(instance, group) : 0;
+    expect(bytes && length >= 6 && *reinterpret_cast<const WORD*>(bytes + 4) == 10,
+           "the executable embeds all ten DPI-aware ICO frames from 16 to 256 pixels");
+}
+{
     box::Backdrop source; source.SetSource(73, 49, std::vector<DWORD>(73 * 49, 0x003478BC));
     Check(source.Blur(18) ? S_OK : E_FAIL);
     auto snapshot = source.SourceSnapshot(); source.Clear();
@@ -92,8 +247,14 @@
     warm.HidePanel(); warm.dpi_ = 96; // Keep the fixed-budget cache checks independent of the machine's display scaling.
     warm.nativeMode_ = true; warm.nativeLocated_ = true;
     GetWindowRect(warm.host, &warm.nativeCell_); warm.nativeImage_ = warm.nativeCell_;
+    warm.nativeImage_.right = warm.nativeImage_.left + 24;
+    warm.nativeImage_.bottom = warm.nativeImage_.top + 24;
+    warm.direction_ = box::Direction::Right;
     const POINT point{warm.nativeImage_.left + 2, warm.nativeImage_.top + 2};
     warm.NativeMouse(point, true, false);
+    RECT placed{}; GetWindowRect(warm.panel, &placed);
+    expect(placed.left == warm.nativeImage_.right + warm.Px(10),
+           "native desktop panels open beside the visible icon instead of leaving the hidden host cell as a wide gap");
     expect(warm.PanelVisible() && warm.nativeLocated_ && !IsWindowVisible(warm.host),
            "hover uses its verified native icon geometry without blocking on another Explorer lookup or showing a duplicate entrance");
     expect(waitForBackdrop(warm), "the real hover path receives its complete background before a rapid reopen");

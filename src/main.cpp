@@ -9,6 +9,7 @@
 #include <uxtheme.h>
 #include <functional>
 #include "storage.h"
+#include "data_location.h"
 #include <initguid.h>
 #include <taskschd.h>
 #include <sddl.h>
@@ -30,6 +31,9 @@
 #include "desktop.h"
 #include "desktop_mouse.h"
 #include "native_entry.h"
+#include "desktop_namespace.h"
+#include "content_loader.h"
+#include "desktop_bounds_loader.h"
 #include "backdrop.h"
 #include "backdrop_loader.h"
 #include "render_cache.h"
@@ -56,6 +60,14 @@ constexpr UINT kBackdropReady = WM_APP + 14;
 constexpr UINT kCompleteShellSetup = WM_APP + 15;
 constexpr UINT kCompleteBackdropHide = WM_APP + 16;
 constexpr UINT kWarmIcons = WM_APP + 17;
+constexpr UINT kDesktopBoundsReady = WM_APP + 18, kRequestDesktopBounds = WM_APP + 19;
+constexpr UINT kHoverOpenRetry = WM_APP + 20;
+constexpr UINT kOpenRequest = WM_APP + 21;
+constexpr UINT kContentReady = WM_APP + 22, kInitializeBox = WM_APP + 23;
+constexpr UINT kContentBecameReady = WM_APP + 24;
+constexpr UINT kHoverRegionsChanged = WM_APP + 25;
+ULONGLONG processEntryAt = 0;
+bool startupTraceEnabled = false;
 bool backdropNeedsFlush = false; // Accessed only by this UI thread.
 void FlushBackdropHide() {
     if (backdropNeedsFlush) { DwmFlush(); backdropNeedsFlush = false; }
@@ -74,6 +86,20 @@ enum : UINT { kAddItems = 100, kOpenData,
     kDirectionAuto, kDirectionLeft, kDirectionRight, kDirectionUp, kDirectionDown, kStartup, kRefresh,
     kExit, kRemove, kOpen, kReveal,
     kNewBox, kRenameBox, kDeleteBox, kAppearance, kSortManual, kSortModified, kSortName };
+UINT NativeShellCommand(const std::wstring& action) {
+    if (action == L"add") return kAddItems;
+    if (action == L"return") return kDeleteBox;
+    if (action == L"refresh") return kRefresh;
+    const wchar_t* directions[] = {L"auto", L"left", L"right", L"up", L"down"};
+    for (UINT i = 0; i < 5; ++i) if (action == std::wstring(L"direction-") + directions[i]) return kDirectionAuto + i;
+    return 0;
+}
+struct OpenRequest {
+    std::wstring directory;
+    std::vector<std::wstring> paths;
+    bool appearance = false;
+    UINT command = 0;
+};
 struct FlagGuard {
     bool& flag;
     bool previous;
@@ -614,6 +640,7 @@ class App {
     friend int SelfTest(const std::wstring& directory);
     friend int PerformanceTest(const std::wstring& directory);
 #endif
+    friend class Manager;
 public:
     Storage storage;
     HWND host = nullptr, panel = nullptr;
@@ -625,6 +652,7 @@ private:
     std::function<void(App*)> deleteBox_;
     std::function<bool(App*)> activatePanel_;
     HWND owner_ = nullptr, desktopParent_ = nullptr;
+    bool hoverOpenRetryPending_ = false;
     SIZE cell_{};
     int desktopIconSize_ = 0;
     bool anchorShown_ = false, removing_ = false;
@@ -681,6 +709,11 @@ private:
     int hovered_ = -1, firstRow_ = 0, wheelRemainder_ = 0;
     int contextItem_ = -1;
     bool panelVisible_ = false, openingPanel_ = false;
+    bool contentLoaded_ = false;
+    bool contentPending_ = false;
+    unsigned contentGeneration_ = 0;
+    HRESULT contentStatus_ = S_OK;
+    box::ContentLoader contentLoader_;
     ULONGLONG closeDeadline_ = 0;
     bool itemPressed_ = false;
     int pressedItem_ = -1;
@@ -843,6 +876,9 @@ private:
         const auto chosenIcon = settings_ ? (previewIconFile_.empty() ? L"" : storage.iconDirectory + L"\\" + previewIconFile_) : storage.SelectedIconPath();
         if (!chosenIcon.empty())
             folderIcon_ = Icon(reinterpret_cast<HICON>(LoadImageW(nullptr, chosenIcon.c_str(), IMAGE_ICON, std::max(Px(48), desktopIconSize_), std::max(Px(48), desktopIconSize_), LR_LOADFROMFILE)));
+        if (!folderIcon_.value)
+            folderIcon_ = Icon(reinterpret_cast<HICON>(LoadImageW(instance_, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                std::max(Px(48), desktopIconSize_), std::max(Px(48), desktopIconSize_), 0)));
         if (!folderIcon_.value) {
             SHSTOCKICONINFO info{}; info.cbSize = sizeof(info);
             if (SUCCEEDED(SHGetStockIconInfo(SIID_FOLDER, SHGSI_ICON | SHGSI_LARGEICON, &info))) folderIcon_ = Icon(info.hIcon);
@@ -1038,8 +1074,24 @@ private:
         const int compared = StrCmpLogicalW(a.label.c_str(), b.label.c_str());
         return compared != 0 ? compared < 0 : StrCmpLogicalW(a.path.c_str(), b.path.c_str()) < 0;
     }
-    void Reload(std::vector<GhostCard> previous = {}) { RebuildView(true, std::move(previous)); }
-    void RebuildView(bool rescan, std::vector<GhostCard> previous = {}, bool resetScroll = false) {
+    void Reload(std::vector<GhostCard> previous = {}) {
+        if (nativeMode_) {
+            contentLoader_.Start(host, kContentReady);
+            contentGeneration_ = contentLoader_.RequestSnapshot(storage, panelVisible_); contentPending_ = true;
+        } else RebuildView(true, std::move(previous));
+    }
+    void ReceiveContent(std::unique_ptr<box::ContentResult> result) {
+        if (!result || result->generation != contentGeneration_) return;
+        contentPending_ = false; contentStatus_ = result->status;
+        if (SUCCEEDED(result->status)) {
+            const bool first = !contentLoaded_;
+            RebuildView(true, {}, false, &result->entries);
+            if (!panelVisible_) WarmIcons();
+            if (first && owner_) PostMessageW(owner_, kContentBecameReady, 0, 0);
+        } else if (panelVisible_) InvalidateRect(panel, nullptr, FALSE);
+    }
+    void RebuildView(bool rescan, std::vector<GhostCard> previous = {}, bool resetScroll = false,
+                     const std::vector<box::StorageEntry>* snapshot = nullptr) {
         if (previous.empty()) previous = CaptureCards();
         EndMarquee(false);
         itemPressed_ = addPressed_ = sortPressed_ = collapseOnRelease_ = toggleOnRelease_ = false;
@@ -1051,21 +1103,21 @@ private:
         std::vector<Item> pool = std::move(items_); items_.clear();
         for (auto& item : hiddenItems_) pool.push_back(std::move(item)); hiddenItems_.clear();
         if (rescan) {
-            storage.ReconcileOrigins();
+            if (contentLoaded_) storage.ReconcileOrigins();
             std::unordered_map<std::wstring, size_t> cached;
             for (size_t i = 0; i < pool.size(); ++i) cached.emplace(pool[i].path, i);
             std::vector<Item> refreshed;
-            for (const auto& path : storage.Entries()) {
+            const auto local = snapshot ? std::vector<box::StorageEntry>{} : storage.Snapshot();
+            for (const auto& entry : snapshot ? *snapshot : local) {
+                const auto& path = entry.path;
                 Item item; item.path = path; item.label = box::BaseName(path);
                 if (box::IsLink(path)) item.label.resize(item.label.find_last_of(L'.'));
-                item.manualOrder = GetPrivateProfileIntW(L"Order", box::BaseName(path).c_str(), INT_MAX, storage.ini.c_str());
-                WIN32_FILE_ATTRIBUTE_DATA attributes{};
-                if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes))
-                    item.modified = (static_cast<ULONGLONG>(attributes.ftLastWriteTime.dwHighDateTime) << 32) | attributes.ftLastWriteTime.dwLowDateTime;
+                item.manualOrder = entry.manualOrder; item.modified = entry.modified;
                 const auto found = cached.find(path); if (found != cached.end()) item.icon = std::move(pool[found->second].icon);
                 refreshed.push_back(std::move(item));
             }
             pool = std::move(refreshed);
+            contentLoaded_ = true;
         }
         sortMode_ = static_cast<box::SortMode>(std::clamp(storage.ReadInt(L"SortMode", 0), 0, 2));
         std::sort(pool.begin(), pool.end(), [this](const Item& a, const Item& b) { return ItemLess(a, b); });
@@ -1100,8 +1152,12 @@ private:
         storage.Write(L"X", std::to_wstring(rect.left)); storage.Write(L"Y", std::to_wstring(rect.top));
     }
     void PositionPanel() {
-        RECT anchor{}; GetWindowRect(host, &anchor);
-        const auto work = WorkArea(host);
+        RECT anchor{};
+        if (nativeMode_ && nativeLocated_) anchor = nativeImage_;
+        else GetWindowRect(host, &anchor);
+        MONITORINFO monitor{}; monitor.cbSize = sizeof(monitor);
+        GetMonitorInfoW(MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST), &monitor);
+        const auto work = monitor.rcWork;
         const int desiredRows = searchQuery_.empty() ? Rows() : static_cast<int>((totalItems_ + 3) / 4);
         const int desiredHeight = Px(88 + std::clamp(desiredRows, 2, 3) * 110);
         const auto placement = box::PlacePanel(anchor, work, Px(416), desiredHeight, Px(10), direction_);
@@ -1150,7 +1206,7 @@ private:
         wchar_t value[32]{}; swprintf_s(value, L"%d%%", glassTransparency_); SetDlgItemTextW(dialog, 1104, value);
         swprintf_s(value, L"%d", glassBlur_); SetDlgItemTextW(dialog, 1105, value);
         settings_->SetGlassEnabled(backgroundMode_ == 0);
-        settings_->SetIcon(folderIcon_.value, previewIconFile_.empty() ? L"Windows 文件夹" : previewIconFile_);
+        settings_->SetIcon(folderIcon_.value, previewIconFile_.empty() ? L"默认 · 大肥鱼" : previewIconFile_);
     }
     static INT_PTR CALLBACK AppearanceProc(HWND dialog, UINT message, WPARAM w, LPARAM l) {
         auto* app = reinterpret_cast<App*>(GetWindowLongPtrW(dialog, DWLP_USER));
@@ -1456,7 +1512,7 @@ private:
             if (items_.empty() && ghostCards_.empty()) {
                 const int center = (rect.bottom + Px(55)) / 2;
                 DrawItemIcon(dc, {(rect.right - Px(48)) / 2, center - Px(58), (rect.right + Px(48)) / 2, center - Px(10)}, folderIcon_.value);
-                Text(dc, searchQuery_.empty() ? L"把常用项目拖到这里" : L"没有找到匹配的项目", {Px(15), center, rect.right - Px(15), center + Px(25)}, bodyFont_, Foreground(), DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                Text(dc, !contentLoaded_ && nativeMode_ ? FAILED(contentStatus_) ? L"暂时无法读取收纳内容" : L"正在读取收纳内容…" : searchQuery_.empty() ? L"把常用项目拖到这里" : L"没有找到匹配的项目", {Px(15), center, rect.right - Px(15), center + Px(25)}, bodyFont_, Foreground(), DT_CENTER | DT_SINGLELINE | DT_VCENTER);
                 Text(dc, searchQuery_.empty() ? L"文件 · 文件夹 · 快捷方式" : L"换个关键词，或清空搜索", {Px(15), center + Px(28), rect.right - Px(15), center + Px(47)}, smallFont_, Muted(), DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             } else {
                 const int start = firstRow_ * 4, end = std::min(static_cast<int>(items_.size()), start + VisibleRows() * 4);
@@ -1927,6 +1983,8 @@ private:
                 POINT point{}; GetCursorPos(&point); CloseTimer(point, GetTickCount64());
             }
             return 0;
+        case kContentReady:
+            ReceiveContent(std::unique_ptr<box::ContentResult>(reinterpret_cast<box::ContentResult*>(l))); return 0;
         case kIconReady: {
             std::unique_ptr<IconResult> result(reinterpret_cast<IconResult*>(l));
             if (result && result->generation == generation_ && result->index < items_.size()) {
@@ -1976,8 +2034,11 @@ private:
         case kDesktopVisible: {
             POINT cursor{}; GetCursorPos(&cursor);
             if (!nativeMode_ || !NativeIconContains(cursor)) HidePanel();
-            SetTimer(host, kDesktopTimer, 160, nullptr);
-            if (owner_) PostMessageW(owner_, kDesktopVisible, 0, 0);
+            // Explorer owns namespace visibility. Returning to the desktop must
+            // not undo the user's native Delete/hide operation or arm N timers.
+            if (!nativeEntry_.NamespaceMode()) SetTimer(host, kDesktopTimer, 160, nullptr);
+            if (owner_ && (!nativeEntry_.NamespaceMode() || (!eventHosts_.empty() && host == eventHosts_.front())))
+                PostMessageW(owner_, kDesktopVisible, 0, 0);
             return 0;
         }
         case kTray:
@@ -1997,6 +2058,7 @@ private:
         case WM_DESTROY:
             if (!isPanel) {
                 watcher_.Stop();
+                contentLoader_.Stop();
                 eventHosts_.erase(std::remove(eventHosts_.begin(), eventHosts_.end(), host), eventHosts_.end());
                 if (eventHosts_.empty() && foregroundHook_) { UnhookWinEvent(foregroundHook_); foregroundHook_ = nullptr; }
                 if (hostDrop_) { RevokeDragDrop(host); hostDrop_->Release(); hostDrop_ = nullptr; }
@@ -2017,7 +2079,7 @@ public:
         removing_ = true;
         if (panelVisible_) HidePanel();
         recentBackdrop.ForgetOwner(host);
-        watcher_.Stop(); icons_.Stop(); backdropLoader_.Stop();
+        watcher_.Stop(); contentLoader_.Stop(); icons_.Stop(); backdropLoader_.Stop();
         if (IsWindow(host)) DestroyWindow(host);
         if (IsWindow(panel)) DestroyWindow(panel);
         for (HFONT font : {titleFont_, bodyFont_, smallFont_, desktopFont_}) if (font) DeleteObject(font);
@@ -2034,7 +2096,7 @@ public:
         glassTransparency_ = std::clamp(storage.ReadInt(L"GlassTransparency", 55), 0, 100);
         glassBlur_ = std::clamp(storage.ReadInt(L"GlassBlur", 18), 0, 40);
         dpi_ = GetDpiForSystem();
-        const auto grid = box::ReadDesktopGrid(dpi_, !(show && attachDesktop)); cell_ = grid.cell; desktopIconSize_ = grid.iconSize;
+        const auto grid = box::ReadDesktopGrid(dpi_, show && !attachDesktop); cell_ = grid.cell; desktopIconSize_ = grid.iconSize;
         const UINT fontDpi = dpi_;
         LoadAppearance();
         WNDCLASSEXW cls{}; cls.cbSize = sizeof(cls); cls.hInstance = instance_; cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -2072,7 +2134,7 @@ public:
         if (fontDpi != dpi_) LoadAppearance();
         else { SendMessageW(searchEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), TRUE); LayoutSearch(); }
         Round(host); Round(panel);
-        Reload();
+        if (!nativeMode_) Reload();
         if (!nativeMode_) Check(RenderAnchor());
         hostDrop_ = new DropTarget(this); Check(RegisterDragDrop(host, hostDrop_));
         panelDrop_ = new DropTarget(this); Check(RegisterDragDrop(panel, panelDrop_));
@@ -2085,6 +2147,7 @@ public:
             nativeEntry_.Ensure(storage, name_, ExePath(), L"", false, true);
             name_ = storage.Read(L"Name", name_.c_str());
             UpdateNativeBounds();
+            Reload();
         } else if (show) {
             anchorShown_ = true;
             SetWindowPos(host, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -2100,16 +2163,24 @@ public:
         KillTimer(host, kTextCacheTimer); textCacheUntil_ = 0;
         if (nativeMode_) {
             if (!locatedFromHover || !nativeLocated_) UpdateNativeBounds();
+            if (!contentLoaded_) {
+                contentLoader_.Prioritize();
+                MSG message{};
+                while (PeekMessageW(&message, host, kContentReady, kContentReady, PM_REMOVE))
+                    ReceiveContent(std::unique_ptr<box::ContentResult>(reinterpret_cast<box::ContentResult*>(message.lParam)));
+                if (!contentLoaded_ && !contentPending_) Reload();
+            }
         } else if (!IsWindowVisible(host)) ShowWindow(host, SW_SHOWNOACTIVATE);
         PositionPanel(); panelVisible_ = true; QueueVisibleIcons();
         PrepareBackdrop();
         ShowWindow(panel, SW_SHOWNOACTIVATE); InvalidateRect(panel, nullptr, FALSE);
         UpdateWindow(panel);
-        if (owner_) PostMessageW(owner_, kNativeMouse, 0, 0); // Recheck the latest pointer after Shell/backdrop work.
+        if (owner_) PostMessageW(owner_, kHoverRegionsChanged, 0, 0); // Publish the panel and recheck after Shell/backdrop work.
         return true;
     }
     void HidePanel() {
         if (!panel) return;
+        const bool wasVisible = panelVisible_;
         StopMotion(); std::vector<DWORD>().swap(blendScratch_);
         EndMarquee(false); itemPressed_ = addPressed_ = sortPressed_ = false;
         if (GetCapture() == panel) ReleaseCapture();
@@ -2121,6 +2192,7 @@ public:
             recentBackdrop.Retain(std::move(backdrop_), owner_ ? owner_ : host);
         backdrop_.Clear(); customGlass_ = false;
         panelSurface_.Clear();
+        if (wasVisible && owner_) PostMessageW(owner_, kHoverRegionsChanged, 0, 0);
         if (!removing_ && textMasks_.Count()) {
             textCacheUntil_ = GetTickCount64() + 500;
             if (!SetTimer(host, kTextCacheTimer, 500, nullptr)) DropTextCache();
@@ -2165,10 +2237,11 @@ public:
         return true;
     }
     bool AttachedToDesktop() const { return IsWindow(host) && nativeMode_; }
-    bool NativeReady() const { return AttachedToDesktop() && nativeLocated_; }
+    bool NativeReady() const { return AttachedToDesktop() && nativeLocated_ && contentLoaded_; }
+    const std::wstring& NativePath() const { return nativeEntry_.Path(); }
     bool NativeIconContains(POINT point) const { return nativeMode_ && nativeLocated_ && PtInRect(&nativeImage_, point); }
     RECT NativeContextBounds() const { return nativeMode_ && nativeLocated_ ? nativeCell_ : RECT{}; }
-    void UpdateNativeBounds(bool invalidate = false) {
+    void UpdateNativeBounds(bool invalidate = false, bool request = true) {
         if (!nativeMode_) return;
         if (nativeEntry_.RefreshName(storage, name_)) {
             SetWindowTextW(host, (name_ + L" · 桌面文件盒").c_str());
@@ -2176,9 +2249,17 @@ public:
             if (panelVisible_) InvalidateRect(panel, nullptr, FALSE);
         }
         if (invalidate) nativeEntry_.Invalidate();
+        if (owner_) { if (request) PostMessageW(owner_, kRequestDesktopBounds, invalidate ? 1 : 0, 0); return; }
+        RECT cell{}, image{};
+        const bool located = nativeEntry_.Bounds(cell, image);
+        ApplyNativeBounds(cell, image, located);
+    }
+    void ApplyNativeBounds(RECT cell, RECT image, bool located) {
+        if (located && nativeEntry_.RestorePosition(storage)) nativeEntry_.Bounds(cell, image);
         const RECT previous = nativeCell_;
         const bool wasLocated = nativeLocated_;
-        if (nativeEntry_.Bounds(nativeCell_, nativeImage_)) {
+        if (located) {
+            nativeCell_ = cell; nativeImage_ = image;
             nativeLocated_ = true;
             cell_ = {nativeCell_.right - nativeCell_.left, nativeCell_.bottom - nativeCell_.top};
             desktopIconSize_ = nativeImage_.right - nativeImage_.left;
@@ -2193,12 +2274,13 @@ public:
         if (inside) CancelClose();
         else if (nativePointerInside_) ScheduleClose();
         nativePointerInside_ = inside;
-        if (overIcon && !buttonDown && !panelVisible_ && !inMenu_ && !inDialog_) ShowPanel(true);
+        if (overIcon && !buttonDown && !panelVisible_ && !inMenu_ && !inDialog_ && !ShowPanel(true) && owner_ && !hoverOpenRetryPending_)
+            hoverOpenRetryPending_ = PostMessageW(owner_, kHoverOpenRetry, reinterpret_cast<WPARAM>(this), 0) != FALSE;
     }
     void Reveal() {
         if (!IsWindow(host) || removing_) return;
         if (nativeMode_) {
-            if (GetFileAttributesW(nativeEntry_.Path().c_str()) == INVALID_FILE_ATTRIBUTES) nativeEntry_.Ensure(storage, name_, ExePath());
+            nativeEntry_.Reveal(storage, name_, ExePath());
             UpdateNativeBounds(true); return;
         }
         anchorShown_ = true; Check(RenderAnchor()); SetWindowPos(host, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -2211,7 +2293,7 @@ public:
         if (panelVisible_) PositionPanel();
     }
     void Refresh() { Reload(); }
-    void WarmIcons() { if (!panelVisible_) QueueVisibleIcons(true); }
+    void WarmIcons() { if (!panelVisible_ && contentLoaded_) QueueVisibleIcons(true); }
     void RefreshAppearance() { ReloadAppearance(); }
     void Appearance(const AppearanceCommit& commit = {}, const AppearanceSettings* initial = nullptr) { ChooseAppearance(commit, initial); }
     void AppendHoverDiagnostics(std::wstring& text) const {
@@ -2284,6 +2366,10 @@ class Manager {
     std::wstring root_, icons_, journal_;
     HWND controller_ = nullptr;
     std::vector<std::unique_ptr<App>> boxes_;
+    struct PendingBox { std::wstring directory, path; RECT cell{}, image{}; bool located = false; };
+    std::deque<PendingBox> pendingBoxes_;
+    bool initializationPosted_ = false, shellSetupPosted_ = false, startupTraceWritten_ = false;
+    ULONGLONG firstBoxReadyAt_ = 0, allBoxesCreatedAt_ = 0, shellSeenAt_ = 0;
     Icon trayIcon_;
     NOTIFYICONDATAW tray_{};
     bool trayAdded_ = false;
@@ -2292,6 +2378,10 @@ class Manager {
     int desktopRetries_ = 0;
     ULONGLONG desktopRetryStarted_ = 0, desktopRetryDeadline_ = 0;
     ULONGLONG mouseReadyAt_ = 0, desktopReadyAt_ = 0, createdAt_ = GetTickCount64();
+    ULONGLONG uiReadyAt_ = 0, lastDesktopReadyAt_ = 0, boundsGeneration_ = 0, lastBoundsMs_ = 0;
+    unsigned boundsRequests_ = 0;
+    bool boundsAwaiting_ = false;
+    box::DesktopBoundsLoader boundsLoader_;
     ULONG desktopNotifications_ = 0;
     box::DesktopMouse mouse_;
     ULONGLONG lastNativeRefresh_ = 0, lastSurfaceRefresh_ = 0;
@@ -2310,19 +2400,43 @@ class Manager {
         return true;
     }
     void BeginDesktopRetry() {
-        desktopRetries_ = 0; desktopRetryStarted_ = GetTickCount64(); desktopReadyAt_ = 0;
+        desktopRetries_ = 0; desktopRetryStarted_ = GetTickCount64();
         desktopRetryDeadline_ = desktopRetryStarted_ + 60000;
         SetTimer(controller_, kDesktopTimer, 100, nullptr);
     }
     bool DesktopReady() const {
-        return IsWindow(desktopSurface_) && std::all_of(boxes_.begin(), boxes_.end(), [](const auto& box) { return box->NativeReady(); });
+        return pendingBoxes_.empty() && IsWindow(desktopSurface_) && std::all_of(boxes_.begin(), boxes_.end(), [](const auto& box) { return box->NativeReady(); });
+    }
+    void RecordReadiness() {
+        const auto now = GetTickCount64();
+        if (!firstBoxReadyAt_ && std::any_of(boxes_.begin(), boxes_.end(), [](const auto& box) { return box->NativeReady(); })) firstBoxReadyAt_ = now;
+        if (DesktopReady()) {
+            if (!desktopReadyAt_) desktopReadyAt_ = now;
+            lastDesktopReadyAt_ = now; KillTimer(controller_, kDesktopTimer); desktopRetryDeadline_ = 0;
+            if (startupTraceEnabled && !startupTraceWritten_) {
+                const auto origin = processEntryAt ? processEntryAt : createdAt_;
+                const std::string json = "{\n  \"clock\":\"milliseconds since WinMain entry\",\n  \"shell_observation\":\"first available desktop observation, not first icon presentation\",\n" +
+                    std::string("  \"input_listener_ms\":") + std::to_string(mouseReadyAt_ - origin) +
+                    ",\n  \"input_loop_ms\":" + std::to_string(uiReadyAt_ - origin) +
+                    ",\n  \"shell_observed_ms\":" + std::to_string(shellSeenAt_ ? shellSeenAt_ - origin : 0) +
+                    ",\n  \"first_box_interactive_ms\":" + std::to_string(firstBoxReadyAt_ ? firstBoxReadyAt_ - origin : 0) +
+                    ",\n  \"all_boxes_created_ms\":" + std::to_string(allBoxesCreatedAt_ ? allBoxesCreatedAt_ - origin : 0) +
+                    ",\n  \"all_boxes_interactive_ms\":" + std::to_string(desktopReadyAt_ - origin) +
+                    ",\n  \"last_bounds_query_ms\":" + std::to_string(lastBoundsMs_) +
+                    ",\n  \"box_count\":" + std::to_string(boxes_.size()) + "\n}\n";
+                startupTraceWritten_ = WriteBytes(root_ + L"\\startup-trace.json", json.data(), static_cast<DWORD>(json.size()));
+            }
+        }
     }
     void RetryDesktop() {
-        RestoreDesktop(); RefreshNative(true); NativePointer(false);
+        RestoreDesktop(); RefreshNative(); NativePointer(false);
         const ULONGLONG now = GetTickCount64();
         if (DesktopReady() || !desktopRetryDeadline_ || now >= desktopRetryDeadline_) {
             KillTimer(controller_, kDesktopTimer); desktopRetryDeadline_ = 0;
-            if (DesktopReady()) desktopReadyAt_ = now;
+            if (DesktopReady()) {
+                if (!desktopReadyAt_) desktopReadyAt_ = now;
+                lastDesktopReadyAt_ = now;
+            }
         } else {
             ++desktopRetries_;
             const ULONGLONG elapsed = now - desktopRetryStarted_;
@@ -2331,17 +2445,23 @@ class Manager {
     }
     void PublishContextTargets() {
         std::vector<box::DesktopContextTarget> targets;
+        std::vector<RECT> hover;
         for (const auto& box : boxes_) {
+            if (box->nativeLocated_) hover.push_back(box->nativeImage_);
+            if (box->PanelVisible()) { RECT bounds{}; GetWindowRect(box->panel, &bounds); InflateRect(&bounds, box->Px(16), box->Px(16)); hover.push_back(bounds); }
+            // Namespace objects expose their menu to Explorer, including keyboard invocation.
+            if (box->nativeEntry_.NamespaceMode()) continue;
             const RECT bounds = box->NativeContextBounds();
             if (!IsRectEmpty(&bounds)) targets.push_back({bounds, reinterpret_cast<UINT_PTR>(box.get())});
         }
         mouse_.SetContextTargets(desktopSurface_, std::move(targets));
+        mouse_.SetHoverRegions(std::move(hover), DesktopReady());
     }
     void UpdateShellIntegration() {
         Storage defaults(root_, icons_, journal_);
         const auto selected = AppearanceSettings::NewBoxDefaults(defaults).icon;
         const auto icon = selected.empty() ? L"" : icons_ + L"\\" + box::BaseName(selected);
-        Check(box::RegisterUserShellNew(ExePath(), root_, box::ShellNewIcon(icon)));
+        Check(box::RegisterUserShellNew(ExePath(), root_, box::ShellNewIcon(icon, ExePath())));
         RefreshTrayIcon();
     }
     void RefreshTrayIcon() {
@@ -2356,6 +2476,11 @@ class Manager {
                 size, size, LR_LOADFROMFILE)));
         }
         const bool customIconLoaded = replacement.value != nullptr;
+        if (!replacement.value) {
+            const UINT dpi = GetDpiForWindow(controller_);
+            const int size = GetSystemMetricsForDpi(SM_CXSMICON, dpi ? dpi : USER_DEFAULT_SCREEN_DPI);
+            replacement = Icon(reinterpret_cast<HICON>(LoadImageW(instance_, MAKEINTRESOURCEW(1), IMAGE_ICON, size, size, 0)));
+        }
         if (!replacement.value) {
             SHSTOCKICONINFO stock{}; stock.cbSize = sizeof(stock);
             Check(SHGetStockIconInfo(SIID_FOLDER, SHGSI_ICON | SHGSI_SMALLICON, &stock));
@@ -2380,13 +2505,50 @@ class Manager {
         return !GetGUIThreadInfo(GetWindowThreadProcessId(surface, nullptr), &gui) || !(gui.flags & GUI_INMENUMODE);
     }
     void RefreshNative(bool invalidate = false) {
-        desktopSurface_ = box::DesktopSurface();
+        const HWND surface = box::DesktopSurface();
+        if (surface != desktopSurface_) {
+            invalidate = true;
+            for (const auto& box : boxes_) box->NativeUnavailable();
+        }
+        desktopSurface_ = surface;
         for (auto& box : boxes_) {
-            if (desktopSurface_) box->UpdateNativeBounds(invalidate);
+            if (desktopSurface_) box->UpdateNativeBounds(invalidate, false);
             else box->NativeUnavailable();
         }
         PublishContextTargets();
         lastSurfaceRefresh_ = lastNativeRefresh_ = GetTickCount64();
+        RequestNativeBounds(invalidate);
+    }
+    void RequestNativeBounds(bool invalidate = false) {
+        if (!integrateUser_ || !IsWindow(desktopSurface_) || (boundsAwaiting_ && !invalidate)) return;
+        std::vector<std::wstring> paths;
+        for (const auto& box : boxes_) if (!box->NativePath().empty()) paths.push_back(box->NativePath());
+        for (const auto& box : pendingBoxes_) if (!box.path.empty()) paths.push_back(box.path);
+        if (paths.empty()) return;
+        const auto generation = boundsGeneration_ + 1;
+        if (boundsLoader_.RequestBounds(controller_, kDesktopBoundsReady, desktopSurface_, std::move(paths), generation)) {
+            boundsGeneration_ = generation; boundsAwaiting_ = true; ++boundsRequests_;
+        }
+    }
+    void ReceiveNativeBounds(const box::DesktopBoundsResult& result) {
+        if (result.generation != boundsGeneration_) return;
+        boundsAwaiting_ = false;
+        if (result.desktop != desktopSurface_ || !IsWindow(result.desktop)) return;
+        lastBoundsMs_ = result.elapsed;
+        for (auto& box : pendingBoxes_) {
+            const auto item = std::find_if(result.entries.begin(), result.entries.end(), [&](const auto& entry) { return _wcsicmp(entry.path.c_str(), box.path.c_str()) == 0; });
+            box.located = item != result.entries.end() && item->located;
+            if (box.located) { box.cell = item->cell; box.image = item->image; }
+        }
+        for (const auto& box : boxes_) {
+            const auto item = std::find_if(result.entries.begin(), result.entries.end(), [&](const auto& entry) {
+                return _wcsicmp(entry.path.c_str(), box->NativePath().c_str()) == 0;
+            });
+            if (item == result.entries.end()) box->NativeUnavailable();
+            else box->ApplyNativeBounds(item->cell, item->image, item->located);
+        }
+        RecordReadiness();
+        PublishContextTargets(); NativePointer(false);
     }
     void SchedulePointerSettle() {
         pointerSettleDue_ = GetTickCount64() + 80;
@@ -2424,6 +2586,7 @@ class Manager {
             if (surface != desktopSurface_) RefreshNative(true);
         }
         const bool desktop = OnDesktop(point);
+        if (desktop) PrioritizePending(point);
         if (desktop && now - lastNativeRefresh_ > 500) RefreshNative();
         mouse_.SetPointerContext(point, desktop, GetForegroundWindow());
         const bool buttonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) || (GetAsyncKeyState(VK_RBUTTON) & 0x8000);
@@ -2549,7 +2712,14 @@ class Manager {
             L"\r\nmenu_open=" + std::to_wstring(contextMenuOpen_) + L"\r\ndesktop_surface=" + std::to_wstring(IsWindow(desktopSurface_)) +
             L"\r\ntray_custom_icon=" + std::to_wstring(trayCustomIcon_) +
             L"\r\nmouse_ready_ms=" + std::to_wstring(mouseReadyAt_ ? mouseReadyAt_ - createdAt_ : 0) +
+            L"\r\nui_ready_ms=" + std::to_wstring(uiReadyAt_ ? uiReadyAt_ - createdAt_ : 0) +
+            L"\r\nfirst_box_ready_ms=" + std::to_wstring(firstBoxReadyAt_ ? firstBoxReadyAt_ - createdAt_ : 0) +
+            L"\r\npending_boxes=" + std::to_wstring(pendingBoxes_.size()) +
             L"\r\ndesktop_ready_ms=" + std::to_wstring(desktopReadyAt_ ? desktopReadyAt_ - createdAt_ : 0) +
+            L"\r\nlast_desktop_ready_ms=" + std::to_wstring(lastDesktopReadyAt_ ? lastDesktopReadyAt_ - createdAt_ : 0) +
+            L"\r\nbounds_query_ms=" + std::to_wstring(lastBoundsMs_) +
+            L"\r\nbounds_pending=" + std::to_wstring(boundsLoader_.Busy()) +
+            L"\r\nbounds_requests=" + std::to_wstring(boundsRequests_) +
             L"\r\ndesktop_retry_pending=" + std::to_wstring(desktopRetryDeadline_ != 0) +
             L"\r\ndesktop_retry_attempts=" + std::to_wstring(desktopRetries_) +
             L"\r\ncursor=" + std::to_wstring(point.x) + L"," + std::to_wstring(point.y) + L"\r\non_desktop=" + std::to_wstring(OnDesktop(point)) +
@@ -2588,6 +2758,50 @@ class Manager {
         if (box->storage.ReadInt(L"Deleted", 0)) return;
         box->Initialize(integrateUser_, integrateUser_); boxes_.push_back(std::move(box));
     }
+    void QueueBox(const std::wstring& directory, bool staged) {
+        if (!staged) { Attach(directory); return; }
+        const auto ini = directory + L"\\settings.ini";
+        if (GetPrivateProfileIntW(L"DesktopBox", L"Deleted", 0, ini.c_str())) return;
+        wchar_t id[64]{}, mode[32]{};
+        GetPrivateProfileStringW(L"DesktopBox", L"DesktopNamespace", L"", id, 64, ini.c_str());
+        GetPrivateProfileStringW(L"DesktopBox", L"DesktopEntryMode", L"", mode, 32, ini.c_str());
+        std::wstring path;
+        if (wcscmp(mode, L"shortcut") != 0 && box::IsDesktopNamespaceId(id)) path = L"::" + std::wstring(id);
+        else {
+            std::vector<wchar_t> value(512);
+            for (;;) {
+                const DWORD count = GetPrivateProfileStringW(L"DesktopBox", L"DesktopLink", L"", value.data(), static_cast<DWORD>(value.size()), ini.c_str());
+                if (count < value.size() - 1 || value.size() >= 32768) { path.assign(value.data(), count); break; }
+                value.resize(value.size() * 2);
+            }
+        }
+        pendingBoxes_.push_back({directory, std::move(path)});
+    }
+    void PrioritizePending(POINT point) {
+        const auto hit = std::find_if(pendingBoxes_.begin(), pendingBoxes_.end(), [&](const auto& box) { return box.located && PtInRect(&box.image, point); });
+        if (hit != pendingBoxes_.end() && hit != pendingBoxes_.begin()) {
+            auto box = std::move(*hit); pendingBoxes_.erase(hit); pendingBoxes_.push_front(std::move(box));
+        }
+    }
+    void PostInitializeBox() {
+        if (!pendingBoxes_.empty() && !initializationPosted_)
+            initializationPosted_ = PostMessageW(controller_, kInitializeBox, 0, 0) != FALSE;
+    }
+    void FinishInitialization() {
+        if (!pendingBoxes_.empty() || shellSetupPosted_) return;
+        allBoxesCreatedAt_ = GetTickCount64(); shellSetupPosted_ = true;
+        if (integrateUser_) { PostMessageW(controller_, kCompleteShellSetup, 0, 0); PostMessageW(controller_, kWarmIcons, 0, 0); }
+        RecordReadiness();
+    }
+    void InitializeNextBox() {
+        if (pendingBoxes_.empty()) { FinishInitialization(); return; }
+        auto next = std::move(pendingBoxes_.front()); pendingBoxes_.pop_front();
+        const auto count = boxes_.size(); Attach(next.directory);
+        if (boxes_.size() != count && next.located && boxes_.back()->NativePath() == next.path)
+            boxes_.back()->ApplyNativeBounds(next.cell, next.image, true);
+        if (integrateUser_) { RequestNativeBounds(); NativePointer(false); }
+        PostInitializeBox(); FinishInitialization();
+    }
     void NewBox(const std::wstring& name, POINT point) {
         GUID guid{}; Check(CoCreateGuid(&guid)); wchar_t id[64]{}; StringFromGUID2(guid, id, 64);
         auto directory = root_ + L"\\boxes\\" + id;
@@ -2596,6 +2810,7 @@ class Manager {
         Storage defaults(root_, icons_, journal_);
         AppearanceSettings::NewBoxDefaults(defaults).Save(data);
         data.Write(L"Direction", std::to_wstring(std::clamp(defaults.ReadInt(L"NewBoxDirection", 0), 0, 4)));
+        data.Write(L"DesktopEntryMode", defaults.Read(L"DesktopEntryMode"));
         Attach(directory);
         RefreshNative(true);
     }
@@ -2614,6 +2829,26 @@ class Manager {
     LRESULT Handle(UINT message, WPARAM w, LPARAM l) {
         if (taskbarCreated_ && message == taskbarCreated_) { Tray(); BeginDesktopRetry(); return 0; }
         switch (message) {
+        case kInitializeBox: initializationPosted_ = false; InitializeNextBox(); return 0;
+        case kContentBecameReady: RecordReadiness(); PublishContextTargets(); NativePointer(false); return 0;
+        case kHoverRegionsChanged: PublishContextTargets(); NativePointer(false); return 0;
+        case kRequestDesktopBounds: RequestNativeBounds(w != 0); return 0;
+        case kDesktopBoundsReady: {
+            std::unique_ptr<box::DesktopBoundsResult> result(reinterpret_cast<box::DesktopBoundsResult*>(l));
+            if (result) ReceiveNativeBounds(*result);
+            else if (w == boundsGeneration_) boundsAwaiting_ = false;
+            return 0;
+        }
+        case kHoverOpenRetry:
+            for (const auto& box : boxes_) if (reinterpret_cast<WPARAM>(box.get()) == w) {
+                box->hoverOpenRetryPending_ = false; SchedulePointerSettle(); break;
+            }
+            return 0;
+        case kOpenRequest: {
+            std::unique_ptr<OpenRequest> request(reinterpret_cast<OpenRequest*>(l));
+            if (request) Open(request->directory, request->paths, request->appearance, request->command);
+            return 0;
+        }
         case kCompleteBackdropHide: FlushBackdropHide(); return 0;
         case kCompleteShellSetup: UpdateShellIntegration(); return 0;
         case kWarmIcons: for (const auto& box : boxes_) box->WarmIcons(); return 0;
@@ -2628,7 +2863,7 @@ class Manager {
         }
         case WM_COPYDATA: {
             const auto* packet = reinterpret_cast<COPYDATASTRUCT*>(l);
-            if (!packet || (packet->dwData != 0x44424F58 && packet->dwData != 0x44424F59 && packet->dwData != 0x44424F5A && packet->dwData != 0x44424F5B) || packet->cbData < 4 || packet->cbData > 2 * 1024 * 1024 || packet->cbData % sizeof(wchar_t)) return FALSE;
+            if (!packet || (packet->dwData != 0x44424F58 && packet->dwData != 0x44424F59 && packet->dwData != 0x44424F5A && packet->dwData != 0x44424F5B && packet->dwData != 0x44424F5C) || packet->cbData < 4 || packet->cbData > 2 * 1024 * 1024 || packet->cbData % sizeof(wchar_t)) return FALSE;
             const auto* data = static_cast<const wchar_t*>(packet->lpData);
             const size_t size = packet->cbData / sizeof(wchar_t);
             if (!data || data[size - 1] != L'\0') return FALSE;
@@ -2645,7 +2880,16 @@ class Manager {
                 if (packet->dwData == 0x44424F5B) return WriteHoverDiagnostics();
                 return PostMessageW(controller_, kCreateShellBox, 0, 0);
             }
-            const auto target = fields.front(); fields.erase(fields.begin()); Open(target, fields, packet->dwData == 0x44424F59); return TRUE;
+            if (packet->dwData != 0x44424F58 && packet->dwData != 0x44424F59 && packet->dwData != 0x44424F5C) return FALSE;
+            auto request = std::make_unique<OpenRequest>();
+            request->directory = std::move(fields.front()); fields.erase(fields.begin());
+            if (packet->dwData == 0x44424F5C) {
+                if (fields.size() != 1 || !(request->command = NativeShellCommand(fields.front()))) return FALSE;
+            } else request->paths = std::move(fields);
+            request->appearance = packet->dwData == 0x44424F59;
+            if (!PostMessageW(controller_, kOpenRequest, 0, reinterpret_cast<LPARAM>(request.get()))) return FALSE;
+            request.release();
+            return TRUE;
         }
         case kCreateShellBox: { POINT point{}; GetCursorPos(&point); NewBox(L"桌面收纳盒", point); return 0; }
         case kShellIconChanged:
@@ -2709,63 +2953,77 @@ public:
         : instance_(instance), root_(std::move(root)), icons_(std::move(icons)), journal_(root_ + L"\\origins") {}
     ~Manager() {
         recentBackdrop.ForgetOwner(controller_);
+        boundsLoader_.Stop();
         if (desktopNotifications_) SHChangeNotifyDeregister(desktopNotifications_);
         mouse_.Stop();
         boxes_.clear();
         if (trayAdded_) Shell_NotifyIconW(NIM_DELETE, &tray_);
         if (IsWindow(controller_)) DestroyWindow(controller_);
     }
-    void Open(const std::wstring& directory, const std::vector<std::wstring>& paths = {}, bool appearance = false) {
+    void Open(const std::wstring& directory, const std::vector<std::wstring>& paths = {}, bool appearance = false, UINT command = 0) {
         if (directory.empty() && appearance) { GlobalAppearance(); return; }
+        const auto pending = std::find_if(pendingBoxes_.begin(), pendingBoxes_.end(), [&](const auto& box) { return _wcsicmp(box.directory.c_str(), directory.c_str()) == 0; });
+        if (pending != pendingBoxes_.end()) {
+            auto box = std::move(*pending); pendingBoxes_.erase(pending); pendingBoxes_.push_front(std::move(box)); InitializeNextBox();
+        }
         for (auto& box : boxes_) if (_wcsicmp(directory.c_str(), box->storage.root.c_str()) == 0) {
+            if (command) { box->Command(command); return; }
+            box->Reveal(); box->ShowPanel();
             if (!paths.empty()) box->AddPaths(paths);
-            box->Reveal(); box->ShowPanel(); if (appearance) box->Appearance(); return;
+            if (appearance) box->Appearance(); return;
         }
         if (directory.empty()) {
             for (auto& box : boxes_) box->Reveal();
             if (!boxes_.empty()) { boxes_.front()->ShowPanel(); if (appearance) boxes_.front()->Appearance(); }
         }
     }
-    void Initialize(bool integrateUser = true) {
+    void Initialize(bool integrateUser = true, bool deferBoxes = false) {
         integrateUser_ = integrateUser;
-        EnsureDirectory(root_); EnsureDirectory(icons_); EnsureDirectory(journal_); EnsureDirectory(root_ + L"\\boxes");
-        Storage defaults(root_, icons_, journal_);
-        if (!defaults.ReadInt(L"HasNewBoxAppearance", 0)) AppearanceSettings::NewBoxDefaults(defaults).SaveNewBoxDefaults(defaults);
         WNDCLASSEXW cls{}; cls.cbSize = sizeof(cls); cls.hInstance = instance_; cls.lpfnWndProc = WindowProc; cls.lpszClassName = kControllerClass;
         if (!RegisterClassExW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) throw HRESULT_FROM_WIN32(GetLastError());
-        Check(CreateWindowExW(0, kControllerClass, kTitle, WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance_, this) ? S_OK : HRESULT_FROM_WIN32(GetLastError()));
+        Check(CreateWindowExW(0, kControllerClass, kTitle, WS_OVERLAPPED,
+            0, 0, 0, 0, nullptr, nullptr, instance_, this) ? S_OK : HRESULT_FROM_WIN32(GetLastError()));
         taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
         if (integrateUser_) {
             desktopSurface_ = box::DesktopSurface();
             Check(mouse_.Start(controller_, kNativeMouse, kNativeContext)); mouseReadyAt_ = GetTickCount64();
+            if (IsWindow(desktopSurface_)) shellSeenAt_ = GetTickCount64();
         }
+        EnsureDirectory(root_); EnsureDirectory(icons_); EnsureDirectory(journal_); EnsureDirectory(root_ + L"\\boxes");
+        Storage defaults(root_, icons_, journal_);
+        if (!defaults.ReadInt(L"HasNewBoxAppearance", 0)) AppearanceSettings::NewBoxDefaults(defaults).SaveNewBoxDefaults(defaults);
         RefreshTrayIcon();
         if (integrateUser_) Tray();
-        Attach(root_);
+        const bool staged = integrateUser_ || deferBoxes;
+        QueueBox(root_, staged);
         WIN32_FIND_DATAW found{}; HANDLE search = FindFirstFileW((root_ + L"\\boxes\\*").c_str(), &found);
         if (search != INVALID_HANDLE_VALUE) {
             do {
                 if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(found.cFileName, L".") && wcscmp(found.cFileName, L"..")) {
                     auto directory = root_ + L"\\boxes\\" + found.cFileName;
-                    if (GetFileAttributesW((directory + L"\\settings.ini").c_str()) != INVALID_FILE_ATTRIBUTES) Attach(directory);
+                    if (GetFileAttributesW((directory + L"\\settings.ini").c_str()) != INVALID_FILE_ATTRIBUTES) QueueBox(directory, staged);
                 }
             } while (FindNextFileW(search, &found));
             FindClose(search);
         }
-        if (!integrateUser_) return;
+        if (staged) PostInitializeBox();
+        if (!integrateUser_) { uiReadyAt_ = GetTickCount64(); FinishInitialization(); return; }
         BeginDesktopRetry();
         RefreshNative(true);
         NativePointer();
-        if (DesktopReady()) { desktopReadyAt_ = GetTickCount64(); KillTimer(controller_, kDesktopTimer); desktopRetryDeadline_ = 0; }
-        PostMessageW(controller_, kCompleteShellSetup, 0, 0);
-        PostMessageW(controller_, kWarmIcons, 0, 0);
+        if (DesktopReady()) {
+            if (!desktopReadyAt_) desktopReadyAt_ = GetTickCount64();
+            lastDesktopReadyAt_ = GetTickCount64(); KillTimer(controller_, kDesktopTimer); desktopRetryDeadline_ = 0;
+        }
         PIDLIST_ABSOLUTE desktop = nullptr;
-        if (SUCCEEDED(SHGetKnownFolderIDList(FOLDERID_Desktop, 0, nullptr, &desktop))) {
-            SHChangeNotifyEntry entry{desktop, TRUE};
+        if (SUCCEEDED(SHGetSpecialFolderLocation(nullptr, CSIDL_DESKTOP, &desktop))) {
+            SHChangeNotifyEntry entry{desktop, FALSE};
             desktopNotifications_ = SHChangeNotifyRegister(controller_, SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
-                SHCNE_RENAMEITEM | SHCNE_CREATE | SHCNE_DELETE | SHCNE_UPDATEITEM | SHCNE_UPDATEDIR, kNativeChanged, 1, &entry);
+                SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER | SHCNE_CREATE | SHCNE_MKDIR | SHCNE_DELETE | SHCNE_RMDIR | SHCNE_UPDATEITEM | SHCNE_UPDATEDIR | SHCNE_ATTRIBUTES, kNativeChanged, 1, &entry);
             CoTaskMemFree(desktop);
         }
+        uiReadyAt_ = GetTickCount64();
+        FinishInitialization();
     }
 };
 
@@ -2777,6 +3035,7 @@ public:
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    processEntryAt = GetTickCount64();
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const HRESULT initialized = OleInitialize(nullptr);
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_WIN95_CLASSES | ICC_BAR_CLASSES}; InitCommonControlsEx(&controls);
@@ -2784,10 +3043,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     int exitCode = 0;
     try {
         int count = 0; wchar_t** arguments = CommandLineToArgvW(GetCommandLineW(), &count);
-        std::wstring root, testDirectory, openBox;
+        std::wstring root, testDirectory, openBox, shellAction;
         std::vector<std::wstring> dropPaths;
         bool dropping = false, appearance = false, newBox = false, registerShell = false, unregisterShell = false;
         bool enableStartup = false, disableStartup = false, shutdown = false, diagnostics = false;
+        bool legacyDesktop = false, nativeDesktop = false, namespaceTest = false;
         for (int i = 1; i < count; ++i) {
             if (dropping) { dropPaths.push_back(AbsolutePath(arguments[i])); continue; }
             if (wcscmp(arguments[i], L"--drop") == 0) dropping = true;
@@ -2799,27 +3059,38 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
             else if (wcscmp(arguments[i], L"--disable-startup") == 0) disableStartup = true;
             else if (wcscmp(arguments[i], L"--shutdown") == 0) shutdown = true;
             else if (wcscmp(arguments[i], L"--diagnostics") == 0) diagnostics = true;
+            else if (wcscmp(arguments[i], L"--trace-startup") == 0) startupTraceEnabled = true;
+            else if (wcscmp(arguments[i], L"--legacy-desktop") == 0) legacyDesktop = true;
+            else if (wcscmp(arguments[i], L"--native-desktop") == 0) nativeDesktop = true;
+            else if (wcscmp(arguments[i], L"--shell-action") == 0 && i + 1 < count) shellAction = arguments[++i];
+            else if (wcscmp(arguments[i], L"--namespace-test") == 0 && i + 1 < count) { testDirectory = AbsolutePath(arguments[++i]); namespaceTest = true; }
             else if (wcscmp(arguments[i], L"--open-box") == 0 && i + 1 < count) openBox = AbsolutePath(arguments[++i]);
             else if (wcscmp(arguments[i], L"--data-dir") == 0 && i + 1 < count) root = AbsolutePath(arguments[++i]);
             else if (wcscmp(arguments[i], L"--self-test") == 0 && i + 1 < count) testDirectory = AbsolutePath(arguments[++i]);
         }
         LocalFree(arguments);
+#ifndef DESKTOPBOX_TESTS
+        (void)namespaceTest;
+#endif
+        const UINT shellCommand = NativeShellCommand(shellAction);
+        if ((!shellAction.empty() && (!shellCommand || openBox.empty())) || (legacyDesktop && nativeDesktop)) throw E_INVALIDARG;
         if (!testDirectory.empty()) {
 #ifdef DESKTOPBOX_TESTS
-            exitCode = GetFileAttributesW((testDirectory + L"\\benchmark.flag").c_str()) != INVALID_FILE_ATTRIBUTES ? PerformanceTest(testDirectory) : SelfTest(testDirectory);
+            exitCode = namespaceTest ? NativeNamespaceIntegrationTest(testDirectory) :
+                GetFileAttributesW((testDirectory + L"\\benchmark.flag").c_str()) != INVALID_FILE_ATTRIBUTES ? PerformanceTest(testDirectory) : SelfTest(testDirectory);
 #else
             exitCode = ERROR_NOT_SUPPORTED;
 #endif
         }
         else {
-            if (root.empty() && GetFileAttributesW((box::ParentPath(ExePath()) + L"\\portable.flag").c_str()) != INVALID_FILE_ATTRIBUTES)
-                root = box::ParentPath(ExePath()) + L"\\data";
+            root = box::InstalledDataDirectory(box::ParentPath(ExePath()), root);
             if (root.empty()) {
                 wchar_t* local = nullptr; Check(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local));
                 root = std::wstring(local) + L"\\DesktopBox"; CoTaskMemFree(local);
             }
             const bool portable = GetFileAttributesW((box::ParentPath(ExePath()) + L"\\portable.flag").c_str()) != INVALID_FILE_ATTRIBUTES;
             const std::wstring icons = portable ? box::ParentPath(ExePath()) + L"\\ico" : root + L"\\ico";
+            startupTraceEnabled = startupTraceEnabled || GetFileAttributesW((root + L"\\startup-trace.flag").c_str()) != INVALID_FILE_ATTRIBUTES;
             if (diagnostics) {
                 const HWND existing = FindWindowW(kControllerClass, kTitle);
                 std::wstring request = root; request.push_back(0); request.push_back(0);
@@ -2828,44 +3099,97 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                 const bool ok = existing && SendMessageTimeoutW(existing, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&packet), SMTO_ABORTIFHUNG | SMTO_BLOCK, 1500, &received) && received;
                 OleUninitialize(); return ok ? 0 : 2;
             }
-            if (registerShell || unregisterShell || enableStartup || disableStartup || shutdown) {
-                if (shutdown) {
+            if (registerShell || unregisterShell || enableStartup || disableStartup || shutdown || legacyDesktop || nativeDesktop) {
+                if (shutdown || legacyDesktop || nativeDesktop) {
                     const HWND existing = FindWindowW(kControllerClass, kTitle);
                     DWORD process = 0; if (existing) GetWindowThreadProcessId(existing, &process);
                     KernelHandle running(process ? OpenProcess(SYNCHRONIZE, FALSE, process) : nullptr);
                     if (existing) PostMessageW(existing, WM_CLOSE, 0, 0);
                     if (running.value && WaitForSingleObject(running.value, 10000) == WAIT_TIMEOUT) throw HRESULT_FROM_WIN32(ERROR_TIMEOUT);
                 }
-                if (unregisterShell) Check(box::UnregisterUserShellNew(ExePath()));
+                if (unregisterShell) {
+                    Check(box::UnregisterUserShellNew(ExePath()));
+                    bool changed = false; Check(box::UnregisterDesktopNamespaces(HKEY_CURRENT_USER, ExePath(), changed));
+                    if (changed) SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+                }
+                if (legacyDesktop || nativeDesktop) {
+                    std::vector<std::wstring> directories{root};
+                    WIN32_FIND_DATAW found{}; HANDLE search = FindFirstFileW((root + L"\\boxes\\*").c_str(), &found);
+                    if (search != INVALID_HANDLE_VALUE) {
+                        do {
+                            if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !wcscmp(found.cFileName, L".") || !wcscmp(found.cFileName, L"..")) continue;
+                            const auto directory = root + L"\\boxes\\" + found.cFileName;
+                            if (GetFileAttributesW((directory + L"\\settings.ini").c_str()) != INVALID_FILE_ATTRIBUTES) directories.push_back(directory);
+                        } while (FindNextFileW(search, &found));
+                        FindClose(search);
+                    }
+                    for (const auto& directory : directories) {
+                        Storage data(directory, icons, root + L"\\origins");
+                        data.Write(L"DesktopEntryMode", legacyDesktop ? L"shortcut" : L"namespace");
+                        if (data.ReadInt(L"Deleted", 0)) continue;
+                        box::NativeEntry entry; entry.Ensure(data, data.Read(L"Name", L"桌面收纳盒"), ExePath());
+                    }
+                }
                 if (registerShell) {
                     Storage defaults(root, icons, root + L"\\origins");
                     const auto selected = AppearanceSettings::NewBoxDefaults(defaults).icon;
                     Check(box::RegisterUserShellNew(ExePath(), root,
-                        box::ShellNewIcon(selected.empty() ? L"" : icons + L"\\" + box::BaseName(selected))));
+                        box::ShellNewIcon(selected.empty() ? L"" : icons + L"\\" + box::BaseName(selected), ExePath())));
                 }
                 if (enableStartup || disableStartup) { StartupTask task; task.Set(enableStartup && !disableStartup, root); }
                 OleUninitialize(); return 0;
             }
-            KernelHandle instanceMutex(CreateMutexW(nullptr, FALSE, L"Local\\DesktopBox.SingleInstance.01"));
+            KernelHandle instanceMutex(CreateMutexW(nullptr, TRUE, L"Local\\DesktopBox.SingleInstance.01"));
             if (!instanceMutex.value) throw HRESULT_FROM_WIN32(GetLastError());
             const bool alreadyRunning = GetLastError() == ERROR_ALREADY_EXISTS;
-            const HWND existing = FindWindowW(kControllerClass, kTitle);
+            HWND existing = FindWindowW(kControllerClass, kTitle);
+            bool launchPrimary = !alreadyRunning && !existing;
             if (alreadyRunning || existing) {
-                if (existing && (!openBox.empty() || appearance || newBox)) {
-                    std::wstring payload = newBox ? root : openBox; payload.push_back(L'\0');
-                    for (const auto& path : dropPaths) { payload += path; payload.push_back(L'\0'); }
-                    payload.push_back(L'\0');
-                    COPYDATASTRUCT packet{newBox ? 0x44424F5Au : appearance ? 0x44424F59u : 0x44424F58u, static_cast<DWORD>(payload.size() * sizeof(wchar_t)), payload.data()};
-                    DWORD_PTR received = 0;
-                    if (!SendMessageTimeoutW(existing, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&packet), SMTO_ABORTIFHUNG, 5000, &received) || !received)
-                        throw HRESULT_FROM_WIN32(ERROR_NOT_READY);
-                } else if (existing) PostMessageW(existing, kWake, 0, 0);
-                else throw HRESULT_FROM_WIN32(ERROR_NOT_READY);
+                // The logon task may create the mutex a few milliseconds before
+                // its controller window. Let that instance finish initialization.
+                if (!existing && (!openBox.empty() || appearance || newBox)) {
+                    const ULONGLONG started = GetTickCount64();
+                    const ULONGLONG deadline = started + 10000;
+                    while (!existing && GetTickCount64() < deadline) {
+                        Sleep(10);
+                        existing = FindWindowW(kControllerClass, kTitle);
+                        if (!existing && GetTickCount64() - started >= 1000) {
+                            const DWORD ownership = WaitForSingleObject(instanceMutex.value, 0);
+                            if (ownership == WAIT_OBJECT_0 || ownership == WAIT_ABANDONED) {
+                                // The prior instance exited before creating its window.
+                                // This process now owns the mutex and can finish startup.
+                                existing = FindWindowW(kControllerClass, kTitle);
+                                if (!existing) { launchPrimary = true; break; }
+                                ReleaseMutex(instanceMutex.value);
+                            }
+                        }
+                    }
+                }
+                if (launchPrimary) {
+                    Manager manager(instance, root, icons); manager.Initialize();
+                    if (newBox) PostMessageW(FindWindowW(kControllerClass, kTitle), kCreateShellBox, 0, 0);
+                    if (!openBox.empty() || appearance) manager.Open(openBox, dropPaths, appearance, shellCommand);
+                    MSG message{};
+                    while (GetMessageW(&message, nullptr, 0, 0) > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
+                }
+                else {
+                    if (existing && (!openBox.empty() || appearance || newBox)) {
+                        std::wstring payload = newBox ? root : openBox; payload.push_back(L'\0');
+                        if (shellCommand) { payload += shellAction; payload.push_back(L'\0'); }
+                        else for (const auto& path : dropPaths) { payload += path; payload.push_back(L'\0'); }
+                        payload.push_back(L'\0');
+                        COPYDATASTRUCT packet{newBox ? 0x44424F5Au : shellCommand ? 0x44424F5Cu : appearance ? 0x44424F59u : 0x44424F58u, static_cast<DWORD>(payload.size() * sizeof(wchar_t)), payload.data()};
+                        DWORD_PTR received = 0;
+                        if (!SendMessageTimeoutW(existing, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&packet), SMTO_ABORTIFHUNG, 15000, &received) || !received)
+                            throw HRESULT_FROM_WIN32(ERROR_NOT_READY);
+                    } else if (existing) PostMessageW(existing, kWake, 0, 0);
+                    else throw HRESULT_FROM_WIN32(ERROR_NOT_READY);
+                }
             }
-            else {
+            else if (launchPrimary) {
                 Manager manager(instance, root, icons); manager.Initialize();
                 if (newBox) PostMessageW(FindWindowW(kControllerClass, kTitle), kCreateShellBox, 0, 0);
-                if (!openBox.empty() || appearance) manager.Open(openBox, dropPaths, appearance);
+                if (!openBox.empty() || appearance) manager.Open(openBox, dropPaths, appearance, shellCommand);
                 MSG message{};
                 while (GetMessageW(&message, nullptr, 0, 0) > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
             }

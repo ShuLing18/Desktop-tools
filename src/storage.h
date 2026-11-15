@@ -2,9 +2,16 @@
 #include <windows.h>
 #include <string>
 #include <vector>
+#include <climits>
+#include <functional>
 
 namespace box {
 struct MoveResult { bool complete = true; size_t moved = 0; };
+struct StorageEntry {
+    std::wstring path;
+    ULONGLONG modified = 0;
+    int manualOrder = INT_MAX;
+};
 class Storage {
 public:
     std::wstring root, items, ini, iconDirectory, journalDirectory;
@@ -15,7 +22,9 @@ public:
     std::wstring SelectedIconPath() const;
     std::wstring ImportIcon(const std::wstring& source) const;
     void SetCustomIcon(const std::wstring& source) const;
+    bool EnsureMoveDropTarget() const;
     std::vector<std::wstring> Entries() const;
+    std::vector<StorageEntry> Snapshot(bool includeOrder = true, const std::function<bool()>& cancelled = {}) const;
     std::wstring OriginalPath(const std::wstring& current) const;
     MoveResult MoveInto(const std::vector<std::wstring>& paths, HWND owner = nullptr, bool quiet = false) const;
     MoveResult MoveOut(const std::wstring& path, const std::wstring& destination, HWND owner = nullptr, bool quiet = false) const;

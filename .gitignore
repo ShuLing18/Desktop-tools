@@ -6,4 +6,5 @@ runtime/
 zig-out/
 *.user
 *.suo
+backups/
 

@@ -22,8 +22,6 @@ HRESULT DesktopMouse::Start(HWND target, UINT message, UINT contextMessage, bool
     Stop();
     if (!IsWindow(target) || message < WM_APP) return E_INVALIDARG;
     target_ = target; message_ = message; contextMessage_ = contextMessage; useHook_ = useHook; error_ = ERROR_SUCCESS;
-    RAWINPUTDEVICE device{0x01, 0x02, RIDEV_INPUTSINK, target_};
-    rawInput_ = RegisterRawInputDevices(&device, 1, sizeof(device)) != FALSE;
     ready_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!ready_) return HRESULT_FROM_WIN32(GetLastError());
     thread_ = CreateThread(nullptr, 0, Run, this, 0, &threadId_);
@@ -42,6 +40,24 @@ void DesktopMouse::SetContextTargets(HWND surface, std::vector<DesktopContextTar
     contextSurface_ = surface; contextTargets_.swap(targets);
     approvedContext_ = 0;
     ReleaseSRWLockExclusive(&contextLock_);
+}
+void DesktopMouse::SetHoverRegions(std::vector<RECT> regions, bool known) {
+    AcquireSRWLockExclusive(&contextLock_);
+    hoverRegions_.swap(regions); hoverRegionsKnown_ = known;
+    ReleaseSRWLockExclusive(&contextLock_);
+}
+void DesktopMouse::ObservePointer(POINT point, bool refresh) {
+    if (refresh) { Notify(true); return; }
+    bool withinRegion = true; // Unknown geometry or a busy publisher must never lose input.
+    if (TryAcquireSRWLockShared(&contextLock_)) {
+        if (hoverRegionsKnown_) {
+            withinRegion = false;
+            for (const auto& region : hoverRegions_) if (PtInRect(&region, point)) { withinRegion = true; break; }
+        }
+        ReleaseSRWLockShared(&contextLock_);
+    }
+    const bool previous = pointerWasNear_.exchange(withinRegion);
+    if (withinRegion || previous) Notify(false); // Include the first leave so an open panel closes.
 }
 void DesktopMouse::SetPointerContext(POINT point, bool desktop, HWND foreground) {
     AcquireSRWLockExclusive(&contextLock_);
@@ -77,7 +93,8 @@ void DesktopMouse::ObserveRawMouse(USHORT buttons) {
     // Healthy hooks already post an immediate wake-up. Raw Input remains independent
     // when Windows removes a timed-out hook, without polling the mouse while idle.
     if (now - lastHookInput_.load() > 8) {
-        Notify((buttons & (RI_MOUSE_LEFT_BUTTON_UP | RI_MOUSE_RIGHT_BUTTON_UP | RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL)) != 0);
+        POINT point{}; GetCursorPos(&point);
+        ObservePointer(point, (buttons & (RI_MOUSE_LEFT_BUTTON_UP | RI_MOUSE_RIGHT_BUTTON_UP | RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL)) != 0);
         if (now - lastHookInput_.load() > 2000 && now - lastHookRepair_.load() > 2000) RequestHookRepair();
     }
 }
@@ -105,10 +122,13 @@ void DesktopMouse::Stop() {
         }
         CloseHandle(thread_); thread_ = nullptr;
     }
+    MSG queued{};
+    if (target_ && message_) while (PeekMessageW(&queued, target_, message_, message_, PM_REMOVE)) {}
+    if (target_ && contextMessage_) while (PeekMessageW(&queued, target_, contextMessage_, contextMessage_, PM_REMOVE)) {}
     threadId_ = 0; target_ = nullptr;
     pending_.store(false); refresh_.store(false);
     SetContextTargets(nullptr, {}); rightClick_ = DesktopRightClick{};
-    if (rawInput_) { RAWINPUTDEVICE device{0x01, 0x02, RIDEV_REMOVE, nullptr}; RegisterRawInputDevices(&device, 1, sizeof(device)); rawInput_ = false; }
+    SetHoverRegions({}, false); pointerWasNear_.store(false);
     lastHookInput_.store(0); lastHookRepair_.store(0); repairPending_.store(false);
 }
 
@@ -117,8 +137,17 @@ DWORD WINAPI DesktopMouse::Run(void* context) {
     MSG message{};
     PeekMessageW(&message, nullptr, WM_USER, WM_USER, PM_NOREMOVE); // Create the thread queue before signalling ready.
     current_ = &listener;
+    WNDCLASSW cls{}; cls.lpfnWndProc = RawWindowProc; cls.hInstance = GetModuleHandleW(nullptr); cls.lpszClassName = L"DesktopBox.InputSink.01";
+    if (RegisterClassW(&cls) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS)
+        listener.rawSink_ = CreateWindowExW(0, cls.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, cls.hInstance, &listener);
+    DWORD rawError = listener.rawSink_ ? ERROR_SUCCESS : GetLastError();
+    if (listener.rawSink_) {
+        RAWINPUTDEVICE device{0x01, 0x02, RIDEV_INPUTSINK, listener.rawSink_};
+        listener.rawInput_ = RegisterRawInputDevices(&device, 1, sizeof(device)) != FALSE;
+        if (!listener.rawInput_) rawError = GetLastError();
+    }
     const bool installed = listener.InstallHook();
-    listener.error_ = installed || listener.rawInput_ ? ERROR_SUCCESS : GetLastError();
+    listener.error_ = installed || listener.rawInput_ ? ERROR_SUCCESS : rawError ? rawError : GetLastError();
     SetEvent(listener.ready_);
     if (installed || listener.rawInput_) {
         while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -128,8 +157,21 @@ DWORD WINAPI DesktopMouse::Run(void* context) {
         if (listener.hook_) UnhookWindowsHookEx(listener.hook_);
     }
     listener.hook_ = nullptr;
+    if (listener.rawInput_) {
+        RAWINPUTDEVICE device{0x01, 0x02, RIDEV_REMOVE, nullptr}; RegisterRawInputDevices(&device, 1, sizeof(device)); listener.rawInput_ = false;
+    }
+    if (listener.rawSink_) { DestroyWindow(listener.rawSink_); listener.rawSink_ = nullptr; }
     current_ = nullptr;
     return 0;
+}
+LRESULT CALLBACK DesktopMouse::RawWindowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
+    auto* listener = reinterpret_cast<DesktopMouse*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        listener = static_cast<DesktopMouse*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(listener));
+    }
+    if (message == WM_INPUT && listener) listener->HandleRawInput(l);
+    return DefWindowProcW(window, message, w, l);
 }
 
 LRESULT CALLBACK DesktopMouse::Hook(int code, WPARAM message, LPARAM data) {
@@ -150,7 +192,8 @@ LRESULT CALLBACK DesktopMouse::Hook(int code, WPARAM message, LPARAM data) {
         }
         const bool refresh = message == WM_LBUTTONUP || message == WM_RBUTTONUP ||
                              message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL;
-        if (refresh || message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN) current_->Notify(refresh);
+        if (refresh || message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN)
+            current_->ObservePointer(reinterpret_cast<const MSLLHOOKSTRUCT*>(data)->pt, refresh);
     }
     return CallNextHookEx(nullptr, code, message, data);
 }

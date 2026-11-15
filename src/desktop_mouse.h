@@ -24,13 +24,17 @@ class DesktopMouse {
     std::atomic<bool> pending_{false}, refresh_{false};
     SRWLOCK contextLock_ = SRWLOCK_INIT;
     std::vector<DesktopContextTarget> contextTargets_;
+    std::vector<RECT> hoverRegions_;
+    bool hoverRegionsKnown_ = false;
+    std::atomic<bool> pointerWasNear_{false};
     HWND contextSurface_ = nullptr;
     UINT contextMessage_ = 0;
     HWND contextForeground_ = nullptr;
     UINT_PTR approvedContext_ = 0;
-    bool rawInput_ = false;
+    std::atomic<bool> rawInput_{false};
     bool useHook_ = true;
     HHOOK hook_ = nullptr; // Owned exclusively by the listener thread.
+    HWND rawSink_ = nullptr;
     std::atomic<ULONGLONG> lastHookInput_{0}, lastHookRepair_{0};
     std::atomic<unsigned> hookEvents_{0}, rawEvents_{0}, hookInstallations_{0};
     std::atomic<bool> repairPending_{false};
@@ -38,6 +42,7 @@ class DesktopMouse {
     inline static thread_local DesktopMouse* current_ = nullptr;
     static DWORD WINAPI Run(void* context);
     static LRESULT CALLBACK Hook(int code, WPARAM message, LPARAM data);
+    static LRESULT CALLBACK RawWindowProc(HWND window, UINT message, WPARAM w, LPARAM l);
     void Notify(bool refresh);
     bool InstallHook();
 public:
@@ -47,6 +52,8 @@ public:
     DesktopMouse& operator=(const DesktopMouse&) = delete;
     HRESULT Start(HWND target, UINT message, UINT contextMessage = 0, bool useHook = true);
     void SetContextTargets(HWND surface, std::vector<DesktopContextTarget> targets);
+    void SetHoverRegions(std::vector<RECT> regions, bool known);
+    void ObservePointer(POINT point, bool refresh = false);
     void SetPointerContext(POINT point, bool desktop, HWND foreground);
     UINT_PTR ContextHit(POINT point);
     bool HandleRawInput(LPARAM input);

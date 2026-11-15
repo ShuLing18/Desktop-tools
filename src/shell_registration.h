@@ -5,7 +5,7 @@
 namespace box {
 // classesRoot is HKCU\Software\Classes in production; tests use an isolated key.
 std::wstring ShellNewCommand(const std::wstring& executable, const std::wstring& dataRoot);
-std::wstring ShellNewIcon(const std::wstring& customIcon);
+std::wstring ShellNewIcon(const std::wstring& customIcon, const std::wstring& executable);
 HRESULT RegisterShellNew(HKEY classesRoot, const std::wstring& executable,
                          const std::wstring& dataRoot, const std::wstring& icon, bool& changed);
 HRESULT UnregisterShellNew(HKEY classesRoot, const std::wstring& executable, bool& changed);
